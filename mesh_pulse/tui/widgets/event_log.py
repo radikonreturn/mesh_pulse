@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
+import os
 import time
 import threading
 from collections import deque
+from datetime import datetime
+from pathlib import Path
 
 from rich.console import Group
 from rich.text import Text
 from textual.widgets import Static
+
+# Mirror file lives next to the working directory
+_LOG_FILE = Path(os.getcwd()) / "panel_output.txt"
 
 
 class EventLog:
@@ -16,6 +22,7 @@ class EventLog:
 
     Stores timestamped events that can be rendered by EventLogWidget.
     Can be shared across all subsystems to log events centrally.
+    Every logged message is also mirrored to ``panel_output.txt``.
     """
 
     def __init__(self, max_events: int = 200):
@@ -29,8 +36,18 @@ class EventLog:
             message: Event description.
             level: One of 'info', 'success', 'warning', 'error'.
         """
+        now = time.time()
         with self._lock:
-            self._events.append((time.time(), level, message))
+            self._events.append((now, level, message))
+
+        # ── Mirror to panel_output.txt ──
+        timestamp = datetime.fromtimestamp(now).strftime("%H:%M:%S")
+        line = f"[{timestamp}] {message}\n"
+        try:
+            with open(_LOG_FILE, "a", encoding="utf-8") as fh:
+                fh.write(line)
+        except OSError:
+            pass  # Silently skip if file cannot be written
 
     def get_events(self, count: int = 50) -> list[tuple[float, str, str]]:
         """Return the most recent events."""

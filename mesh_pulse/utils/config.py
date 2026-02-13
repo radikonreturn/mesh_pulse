@@ -36,6 +36,6 @@ except socket.gaierror:
     LOCAL_IP = "127.0.0.1"
 
 # ─── Paths ──────────────────────────────────────────────────────────
-RECEIVE_DIR = os.path.join(os.path.expanduser("~"), "mesh_pulse_received")
+RECEIVE_DIR = "received_files"
 LOG_FILE = os.path.join(os.path.expanduser("~"), ".mesh_pulse.log")
 KEY_FILE = os.path.join(os.path.expanduser("~"), ".mesh_pulse_key")
