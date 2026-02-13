@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mesh-pulse"
+version = "1.0.0"
+description = "A TUI-based Network Mesh & System Resource Monitor"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "Mesh-Pulse Team"}
+]
+dependencies = [
+    "textual>=0.47.0",
+    "rich>=13.7.0",
+    "psutil>=5.9.0",
+    "cryptography>=42.0.0",
+    "click>=8.1.0",
+]
+
+[project.scripts]
+mesh-pulse = "mesh_pulse.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["mesh_pulse*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

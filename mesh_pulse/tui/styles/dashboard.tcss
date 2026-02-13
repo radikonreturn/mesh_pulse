@@ -1,0 +1,70 @@
+/* Mesh-Pulse Dashboard — Textual CSS
+   Layout: 2×2 grid with header, 4 panels, and sticky footer
+   SCOPED to DashboardScreen so it doesn't affect modal screens */
+
+DashboardScreen {
+    layout: grid;
+    grid-size: 2 4;
+    grid-columns: 1fr 1fr;
+    grid-rows: 3 1fr 1fr 3;
+    background: #0d1117;
+}
+
+/* ── Header ── */
+#header {
+    column-span: 2;
+    height: 3;
+    background: #0d1117;
+    color: #58a6ff;
+    text-align: center;
+    text-style: bold;
+    padding: 1 2;
+    border-bottom: heavy #0ea5e9;
+}
+
+/* ── Top-left: Network Mesh ── */
+#peer-panel {
+    border: round #0ea5e9;
+    background: #0d1117;
+    margin: 0 0 0 1;
+    overflow-y: auto;
+    border-title-color: #0ea5e9;
+}
+
+/* ── Top-right: System Health ── */
+#health-panel {
+    border: round #0ea5e9;
+    background: #0d1117;
+    margin: 0 1 0 0;
+    overflow-y: auto;
+    border-title-color: #0ea5e9;
+}
+
+/* ── Bottom-left: File Transfers ── */
+#transfer-panel {
+    border: round #1d76db;
+    background: #0d1117;
+    margin: 0 0 0 1;
+    overflow-y: auto;
+    border-title-color: #1d76db;
+}
+
+/* ── Bottom-right: Event Log ── */
+#log-panel {
+    border: round #1d76db;
+    background: #0d1117;
+    margin: 0 1 0 0;
+    overflow-y: auto;
+    border-title-color: #1d76db;
+}
+
+/* ── Sticky Footer ── */
+#footer {
+    column-span: 2;
+    height: 3;
+    background: #0d1117;
+    color: #8b949e;
+    text-align: center;
+    padding: 1 2;
+    border-top: heavy #0ea5e9;
+}
