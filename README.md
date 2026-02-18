@@ -1,4 +1,4 @@
-<<<<<<< HEAD
+
 # ⚡ Mesh-Pulse CLI
 
 ![Python application](https://github.com/USER_NAME/REPO_NAME/actions/workflows/python-app.yml/badge.svg)
@@ -58,6 +58,7 @@ mesh_pulse/
 ## License
 
 MIT
+
 =======
 # ⚡ Mesh-Pulse CLI
 
