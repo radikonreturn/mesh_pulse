@@ -1,0 +1,28 @@
+version: '3.8'
+
+services:
+  mesh-pulse:
+    build: .
+    image: mesh-pulse:latest
+    container_name: mesh-pulse
+    # Host networking is recommended for UDP broadcast discovery to work effectively on Linux.
+    # On Windows/Mac Docker Desktop, host networking has limitations; port mapping is used as fallback.
+    # network_mode: "host"
+
+    ports:
+      - "37020:37020/udp" # Broadcast Discovery
+      - "5000:5000" # File Transfer
+
+    volumes:
+      - ./received_files:/app/received_files
+      - ./panel_output.txt:/app/panel_output.txt
+
+    environment:
+      - MESH_PULSE_KEY=my-secret-mesh-key
+      - PYTHONUNBUFFERED=1
+
+    # Enable TTY for Textual TUI
+    tty: true
+    stdin_open: true
+
+    restart: unless-stopped
