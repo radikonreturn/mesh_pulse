@@ -116,15 +116,6 @@ mesh_pulse/
 
 ---
 
-## 🤝 Contributing
-
-Contributions are heavily encouraged! To get up and running:
-1. Ensure `ruff` is installed (`pip install ruff`).
-2. Install pre-commit hooks (`pre-commit install`).
-3. Follow the standard GitHub flow (Fork -> Feature Branch -> Pull Request).
-
----
-
 ## 📄 License
 
 This software is released under the [MIT License](LICENSE).
