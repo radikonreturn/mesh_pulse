@@ -5,7 +5,6 @@ from __future__ import annotations
 import time
 
 from rich.progress_bar import ProgressBar
-from rich.table import Table
 from rich.text import Text
 from rich.console import Group
 from textual.widgets import Static

@@ -1,7 +1,6 @@
 """Structured logging with Rich console and file output."""
 
 import logging
-import sys
 from pathlib import Path
 
 from rich.logging import RichHandler

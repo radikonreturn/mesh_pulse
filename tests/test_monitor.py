@@ -1,6 +1,5 @@
 """Tests for SystemMonitor metrics collection."""
 
-import pytest
 
 from mesh_pulse.core.monitor import SystemMetrics, SystemMonitor
 

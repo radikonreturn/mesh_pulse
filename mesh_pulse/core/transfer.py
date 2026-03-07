@@ -17,9 +17,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import json
 import math
-import os
 import socket
 import threading
 import time
@@ -35,9 +33,6 @@ from mesh_pulse.utils.config import (
     TRANSFER_PORT,
 )
 from mesh_pulse.utils.crypto import (
-    decrypt_chunk,
-    derive_key,
-    encrypt_chunk,
     fernet_decrypt,
     fernet_encrypt,
     load_or_generate_key,

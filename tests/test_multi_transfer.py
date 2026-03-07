@@ -1,8 +1,6 @@
 """Tests for multiple file transfer logic."""
 
-import os
-import tempfile
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 from mesh_pulse.core.transfer import SecureTransfer
 
 def test_send_file_multi_call():

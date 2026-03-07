@@ -1,13 +1,9 @@
 """Tests for secure file transfer protocol."""
 
-import json
-import math
 import os
 import tempfile
-import threading
 import time
 
-import pytest
 
 from mesh_pulse.core.transfer import (
     SecureTransfer,
@@ -15,7 +11,6 @@ from mesh_pulse.core.transfer import (
     TransferInfo,
     TransferStatus,
 )
-from mesh_pulse.utils.crypto import derive_key, encrypt_chunk, decrypt_chunk
 
 
 class TestTransferInfo:

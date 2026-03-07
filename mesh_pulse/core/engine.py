@@ -24,7 +24,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from mesh_pulse.core.discovery import PeerDiscovery, PeerManager
-from mesh_pulse.core.monitor import SystemMonitor, get_system_metrics
+from mesh_pulse.core.monitor import SystemMonitor
 from mesh_pulse.core.transfer import FileClient, FileServer
 from mesh_pulse.utils.config import BROADCAST_PORT, TRANSFER_PORT
 from mesh_pulse.utils.logger import get_logger

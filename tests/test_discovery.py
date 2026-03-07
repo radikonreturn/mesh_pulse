@@ -1,7 +1,6 @@
 """Tests for P2P peer discovery and management."""
 
 import time
-import pytest
 
 from mesh_pulse.core.discovery import Peer, PeerManager, PeerStatus
 
