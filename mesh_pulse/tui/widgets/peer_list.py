@@ -58,7 +58,7 @@ class PeerListWidget(Static):
             table.add_row(
                 "",
                 Text("Scanning network...", style="dim italic"),
-                "", "", "", "", "", "",
+                "", "", "", "", "",
             )
         else:
             for peer in sorted(peers, key=lambda p: p.last_seen, reverse=True):

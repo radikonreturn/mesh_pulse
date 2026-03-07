@@ -15,6 +15,7 @@ Security:
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import math
@@ -456,7 +457,22 @@ class SecureTransfer:
         on_transfer_update: Callable | None = None,
         on_file_received: Callable[[TransferInfo], None] | None = None,
     ):
-        self._key = load_or_generate_key()
+        if passphrase:
+            # Derive a deterministic Fernet key from the passphrase so that
+            # peers sharing the same passphrase can decrypt each other's files.
+            from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+            from cryptography.hazmat.primitives import hashes
+
+            kdf = PBKDF2HMAC(
+                algorithm=hashes.SHA256(),
+                length=32,
+                salt=b"mesh-pulse-fernet-salt",
+                iterations=480_000,
+            )
+            raw_key = kdf.derive(passphrase.encode("utf-8"))
+            self._key = base64.urlsafe_b64encode(raw_key)
+        else:
+            self._key = load_or_generate_key()
         self._port = transfer_port
         self._on_update = on_transfer_update
 

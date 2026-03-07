@@ -6,8 +6,11 @@ system monitoring) and renders the dashboard TUI.
 
 from __future__ import annotations
 
+import ipaddress
 import os
+import platform
 from pathlib import Path
+import psutil
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -281,6 +284,25 @@ class SendFileModal(ModalScreen):
                     pass
         return total
 
+    def _get_drives(self) -> list[tuple[str, str]]:
+        drives = []
+        if platform.system() == "Windows":
+            for p in psutil.disk_partitions(all=False):
+                drives.append((f"💾 {p.device}", p.mountpoint))
+        else:
+            drives.append(("💾 Root (/)", "/"))
+            for p in psutil.disk_partitions(all=True):
+                if (p.mountpoint.startswith("/mnt/") or p.mountpoint.startswith("/media/")) and len(p.mountpoint.split("/")) == 3:
+                    drives.append((f"💾 {p.mountpoint}", p.mountpoint))
+        
+        seen = set()
+        unique_drives = []
+        for d in drives:
+            if d[1] not in seen:
+                seen.add(d[1])
+                unique_drives.append(d)
+        return unique_drives
+
     # ── Compose ──────────────────────────────────────────────
 
     def compose(self) -> ComposeResult:
@@ -289,12 +311,18 @@ class SendFileModal(ModalScreen):
         else:
             options = [("No peers discovered", "__none__")]
 
+        drives = self._get_drives()
+        initial_drive = self._start_path if any(d[1] == self._start_path for d in drives) else (drives[0][1] if drives else Select.BLANK)
+
         with Vertical(id="modal-box"):
             yield Static("📡  Initiate File Transfer", id="modal-title")
 
             with Horizontal(id="modal-body"):
                 # ── Left: file browser ──
                 with Vertical(id="browser-panel"):
+                    yield Select(
+                        drives, id="drive-select", prompt="Select Drive...", value=initial_drive
+                    )
                     yield Static(
                         "📂 Browse — click to select / deselect",
                         classes="form-label",
@@ -426,8 +454,14 @@ class SendFileModal(ModalScreen):
         self._update_send_button()
 
     def on_select_changed(self, event: Select.Changed) -> None:
-        """Re-evaluate the Send button when a peer is selected."""
-        self._update_send_button()
+        """Handle dropdown changes."""
+        if event.select.id == "drive-select":
+            if event.value is not Select.BLANK:
+                tree = self.query_one("#file-tree", DirectoryTree)
+                tree.path = str(event.value)
+                tree.reload()
+        else:
+            self._update_send_button()
 
     def on_input_changed(self, event: Input.Changed) -> None:
         """Re-evaluate the Send button when manual IP changes."""
@@ -441,7 +475,11 @@ class SendFileModal(ModalScreen):
             return str(select.value)
         manual = self.query_one("#manual-ip", Input).value.strip()
         if manual:
-            return manual
+            try:
+                ipaddress.ip_address(manual)
+                return manual
+            except ValueError:
+                return None
         return None
 
     def _update_send_button(self) -> None:
@@ -594,7 +632,7 @@ class MeshPulseApp(App):
                     self.event_log.log("No valid files found to send", "error")
 
         self.push_screen(
-            SendFileModal(peer_ips=peer_ips, start_path=os.getcwd()),
+            SendFileModal(peer_ips=peer_ips, start_path=os.path.abspath(os.sep)),
             callback=_on_result,
         )
 

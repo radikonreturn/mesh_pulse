@@ -15,6 +15,8 @@ from textual.widgets import Static
 
 # Mirror file lives next to the working directory
 _LOG_FILE = Path(os.getcwd()) / "panel_output.txt"
+_LOG_MAX_LINES = 500
+_LOG_KEEP_LINES = 400
 
 
 class EventLog:
@@ -46,6 +48,15 @@ class EventLog:
         try:
             with open(_LOG_FILE, "a", encoding="utf-8") as fh:
                 fh.write(line)
+            # Truncate if the file grows too large
+            try:
+                lines = _LOG_FILE.read_text(encoding="utf-8").splitlines(True)
+                if len(lines) > _LOG_MAX_LINES:
+                    _LOG_FILE.write_text(
+                        "".join(lines[-_LOG_KEEP_LINES:]), encoding="utf-8"
+                    )
+            except OSError:
+                pass
         except OSError:
             pass  # Silently skip if file cannot be written
 

@@ -9,6 +9,7 @@ The AESGCM backend is used by SecureTransfer (legacy facade).
 """
 
 import os
+import stat
 import struct
 
 from cryptography.fernet import Fernet
@@ -45,6 +46,11 @@ def load_or_generate_key(path: str = KEY_FILE) -> bytes:
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "wb") as f:
         f.write(key)
+    # Restrict key file to owner-only read/write
+    try:
+        os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
+    except OSError:
+        pass  # Graceful fallback on Windows or restricted environments
     return key
 
 

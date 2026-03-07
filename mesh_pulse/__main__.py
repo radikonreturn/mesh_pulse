@@ -5,8 +5,8 @@ Usage:
 
 Options:
     --key TEXT             Encryption key for file transfers
-    --broadcast-port INT   UDP broadcast port (default: 9999)
-    --transfer-port INT    TCP transfer port (default: 10000)
+    --broadcast-port INT   UDP broadcast port (default: 37020)
+    --transfer-port INT    TCP transfer port (default: 5000)
 """
 
 import click
