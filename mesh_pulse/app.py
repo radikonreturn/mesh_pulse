@@ -292,9 +292,12 @@ class SendFileModal(ModalScreen):
         else:
             drives.append(("💾 Root (/)", "/"))
             for p in psutil.disk_partitions(all=True):
-                if (p.mountpoint.startswith("/mnt/") or p.mountpoint.startswith("/media/")) and len(p.mountpoint.split("/")) == 3:
+                if (
+                    p.mountpoint.startswith("/mnt/")
+                    or p.mountpoint.startswith("/media/")
+                ) and len(p.mountpoint.split("/")) == 3:
                     drives.append((f"💾 {p.mountpoint}", p.mountpoint))
-        
+
         seen = set()
         unique_drives = []
         for d in drives:
@@ -312,7 +315,11 @@ class SendFileModal(ModalScreen):
             options = [("No peers discovered", "__none__")]
 
         drives = self._get_drives()
-        initial_drive = self._start_path if any(d[1] == self._start_path for d in drives) else (drives[0][1] if drives else Select.BLANK)
+        initial_drive = (
+            self._start_path
+            if any(d[1] == self._start_path for d in drives)
+            else (drives[0][1] if drives else Select.BLANK)
+        )
 
         with Vertical(id="modal-box"):
             yield Static("📡  Initiate File Transfer", id="modal-title")
@@ -321,7 +328,10 @@ class SendFileModal(ModalScreen):
                 # ── Left: file browser ──
                 with Vertical(id="browser-panel"):
                     yield Select(
-                        drives, id="drive-select", prompt="Select Drive...", value=initial_drive
+                        drives,
+                        id="drive-select",
+                        prompt="Select Drive...",
+                        value=initial_drive,
                     )
                     yield Static(
                         "📂 Browse — click to select / deselect",
@@ -333,17 +343,19 @@ class SendFileModal(ModalScreen):
                 with Vertical(id="details-panel"):
                     # Recipient section
                     yield Static("🎯 Recipient", classes="section-label")
-                    yield Select(
-                        options, id="peer-select", prompt="Select a peer…"
+                    yield Select(options, id="peer-select", prompt="Select a peer…")
+                    yield Static(
+                        "── or enter IP manually ──", classes="section-divider"
                     )
-                    yield Static("── or enter IP manually ──", classes="section-divider")
                     yield Input(
                         placeholder="192.168.1.x",
                         id="manual-ip",
                     )
 
                     # Selected files section
-                    yield Static("📦 Selected Items  (click to remove)", classes="section-label")
+                    yield Static(
+                        "📦 Selected Items  (click to remove)", classes="section-label"
+                    )
                     yield Static("", id="selection-counter")
                     yield Static(
                         "  Click files or folders on the left",
@@ -426,14 +438,24 @@ class SendFileModal(ModalScreen):
             name = Path(fp).name
             size = self._get_size(fp)
             total_size += size
-            item = ListItem(Label(f"📁 {name}/  ({self._human_size(size)})", classes="file-item-label"), name=fp)
+            item = ListItem(
+                Label(
+                    f"📁 {name}/  ({self._human_size(size)})", classes="file-item-label"
+                ),
+                name=fp,
+            )
             file_list.append(item)
 
         for fp in self._selected_files:
             name = Path(fp).name
             size = self._get_size(fp)
             total_size += size
-            item = ListItem(Label(f"📄 {name}  — {self._human_size(size)}", classes="file-item-label"), name=fp)
+            item = ListItem(
+                Label(
+                    f"📄 {name}  — {self._human_size(size)}", classes="file-item-label"
+                ),
+                name=fp,
+            )
             file_list.append(item)
 
         parts: list[str] = []
@@ -441,7 +463,9 @@ class SendFileModal(ModalScreen):
             parts.append(f"{n_files} file{'s' if n_files > 1 else ''}")
         if n_folders:
             parts.append(f"{n_folders} folder{'s' if n_folders > 1 else ''}")
-        counter.update(f"  📊 {', '.join(parts)}  ·  {self._human_size(total_size)} total")
+        counter.update(
+            f"  📊 {', '.join(parts)}  ·  {self._human_size(total_size)} total"
+        )
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         """Deselect a file/folder when clicked in the selected items list."""
@@ -619,7 +643,7 @@ class MeshPulseApp(App):
                                 all_files.append(os.path.join(root, f))
                     elif os.path.isfile(item):
                         all_files.append(item)
-                
+
                 if all_files:
                     self.transfer.send_file(peer_ip, all_files, message=message)
                     count = len(all_files)

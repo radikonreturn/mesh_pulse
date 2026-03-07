@@ -39,6 +39,7 @@ log = get_logger(__name__)
 
 class PeerStatus(Enum):
     """Lifecycle states for a discovered peer."""
+
     ONLINE = "online"
     STALE = "stale"
 
@@ -46,6 +47,7 @@ class PeerStatus(Enum):
 @dataclass
 class PeerMetrics:
     """Lightweight system metrics snapshot from a peer."""
+
     cpu_percent: float = 0.0
     ram_percent: float = 0.0
     disk_read_bytes: int = 0
@@ -57,6 +59,7 @@ class PeerMetrics:
 @dataclass
 class Peer:
     """Represents a discovered network peer."""
+
     hostname: str
     ip: str
     port: int
@@ -316,7 +319,9 @@ class PeerDiscovery(threading.Thread):
         """Remove peers not seen within PEER_TIMEOUT seconds."""
         now = time.time()
         with self._peers_lock:
-            dead = [ip for ip, ts in self.peers.items() if now - ts > self._peer_timeout]
+            dead = [
+                ip for ip, ts in self.peers.items() if now - ts > self._peer_timeout
+            ]
             for ip in dead:
                 del self.peers[ip]
                 log.info("Peer auto-removed (timeout): %s", ip)

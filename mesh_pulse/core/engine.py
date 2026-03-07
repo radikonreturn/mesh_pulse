@@ -35,6 +35,7 @@ log = get_logger(__name__)
 @dataclass
 class EngineHandles:
     """Handles to all running subsystem threads."""
+
     discovery: PeerDiscovery
     peer_manager: PeerManager
     file_server: FileServer

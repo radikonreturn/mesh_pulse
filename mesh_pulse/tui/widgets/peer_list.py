@@ -46,7 +46,9 @@ class PeerListWidget(Static):
             show_lines=False,
         )
         table.add_column("", width=2, justify="center")
-        table.add_column("Host", style="bold white", min_width=10, ratio=2, no_wrap=True)
+        table.add_column(
+            "Host", style="bold white", min_width=10, ratio=2, no_wrap=True
+        )
         table.add_column("IP Address", style="white", min_width=15, no_wrap=True)
         table.add_column("Status", justify="center", width=8, no_wrap=True)
         table.add_column("CPU", justify="right", width=5)
@@ -58,7 +60,11 @@ class PeerListWidget(Static):
             table.add_row(
                 "",
                 Text("Scanning network...", style="dim italic"),
-                "", "", "", "", "",
+                "",
+                "",
+                "",
+                "",
+                "",
             )
         else:
             for peer in sorted(peers, key=lambda p: p.last_seen, reverse=True):

@@ -46,7 +46,8 @@ class TransferBarWidget(Static):
         # Split into active and completed
         active = [t for t in transfers if t.status == TransferStatus.ACTIVE]
         completed = [
-            t for t in transfers
+            t
+            for t in transfers
             if t.status in (TransferStatus.COMPLETE, TransferStatus.FAILED)
         ]
 
@@ -121,9 +122,7 @@ class TransferBarWidget(Static):
             icon_style = "bold red"
             detail = (xfer.error or "Failed")[:20]
 
-        elapsed = time.strftime(
-            "%H:%M:%S", time.localtime(xfer.started_at)
-        )
+        elapsed = time.strftime("%H:%M:%S", time.localtime(xfer.started_at))
 
         return Text.assemble(
             ("  ", ""),

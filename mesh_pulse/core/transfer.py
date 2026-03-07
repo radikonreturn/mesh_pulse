@@ -62,6 +62,7 @@ class TransferStatus(Enum):
 @dataclass
 class TransferInfo:
     """Tracks the state of an active file transfer."""
+
     filename: str
     filesize: int
     direction: TransferDirection
@@ -245,7 +246,9 @@ class FileServer(threading.Thread):
                 info.status = TransferStatus.COMPLETE
                 log.info(
                     "Received %s from %s (%.2f MB/s, hash OK)",
-                    filename, peer_ip, info.speed_mbps,
+                    filename,
+                    peer_ip,
+                    info.speed_mbps,
                 )
 
         except Exception as e:
@@ -348,9 +351,7 @@ class FileClient:
         with self._lock:
             return list(self._transfers)
 
-    def _send_worker(
-        self, peer_ip: str, filepath: str, message: str | None
-    ) -> None:
+    def _send_worker(self, peer_ip: str, filepath: str, message: str | None) -> None:
         """Worker: compute hash, encrypt, and send a file over TCP."""
         path = Path(filepath)
         if not path.is_file():
@@ -403,9 +404,7 @@ class FileClient:
                     self._notify()
 
             info.status = TransferStatus.COMPLETE
-            log.info(
-                "Sent %s to %s (%.2f MB/s)", path.name, peer_ip, info.speed_mbps
-            )
+            log.info("Sent %s to %s (%.2f MB/s)", path.name, peer_ip, info.speed_mbps)
 
         except (OSError, ConnectionError) as e:
             info.status = TransferStatus.FAILED

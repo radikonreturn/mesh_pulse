@@ -59,8 +59,8 @@ def get_system_metrics() -> dict:
     return {
         "cpu": round(cpu, 1),
         "ram_percent": round(mem.percent, 1),
-        "ram_used_gb": round(mem.used / (1024 ** 3), 2),
-        "ram_total_gb": round(mem.total / (1024 ** 3), 2),
+        "ram_used_gb": round(mem.used / (1024**3), 2),
+        "ram_total_gb": round(mem.total / (1024**3), 2),
         "net_sent": net_sent,
         "net_recv": net_recv,
         "disk_read": disk_read,
@@ -200,19 +200,33 @@ class SystemMonitor:
                     dt = metrics.timestamp - self._prev_metrics.timestamp
                     if dt > 0:
                         # Network throughput
-                        metrics.net_upload_speed = max(0.0, (
-                            metrics.net_sent_bytes - self._prev_metrics.net_sent_bytes
-                        ) / dt)
-                        metrics.net_download_speed = max(0.0, (
-                            metrics.net_recv_bytes - self._prev_metrics.net_recv_bytes
-                        ) / dt)
+                        metrics.net_upload_speed = max(
+                            0.0,
+                            (metrics.net_sent_bytes - self._prev_metrics.net_sent_bytes)
+                            / dt,
+                        )
+                        metrics.net_download_speed = max(
+                            0.0,
+                            (metrics.net_recv_bytes - self._prev_metrics.net_recv_bytes)
+                            / dt,
+                        )
                         # Disk I/O speed
-                        metrics.disk_read_speed = max(0.0, (
-                            metrics.disk_read_bytes - self._prev_metrics.disk_read_bytes
-                        ) / dt)
-                        metrics.disk_write_speed = max(0.0, (
-                            metrics.disk_write_bytes - self._prev_metrics.disk_write_bytes
-                        ) / dt)
+                        metrics.disk_read_speed = max(
+                            0.0,
+                            (
+                                metrics.disk_read_bytes
+                                - self._prev_metrics.disk_read_bytes
+                            )
+                            / dt,
+                        )
+                        metrics.disk_write_speed = max(
+                            0.0,
+                            (
+                                metrics.disk_write_bytes
+                                - self._prev_metrics.disk_write_bytes
+                            )
+                            / dt,
+                        )
 
                 self._prev_metrics = metrics
 
@@ -220,7 +234,7 @@ class SystemMonitor:
                     self._latest = metrics
                     self._history.append(metrics)
                     if len(self._history) > self._history_size:
-                        self._history = self._history[-self._history_size:]
+                        self._history = self._history[-self._history_size :]
 
                 if self._on_update:
                     self._on_update(metrics)

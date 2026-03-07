@@ -62,7 +62,8 @@ def _wait_for_transfers(
     while time.time() < deadline:
         transfers = server.get_transfers()
         done = [
-            t for t in transfers
+            t
+            for t in transfers
             if t.status in (TransferStatus.COMPLETE, TransferStatus.FAILED)
         ]
         if len(done) >= expected_count:
@@ -210,9 +211,7 @@ class TestLoopbackMultiFile:
             client.send_multiple("127.0.0.1", files)
             transfers = _wait_for_transfers(server, 3, timeout=20)
 
-            completed = [
-                t for t in transfers if t.status == TransferStatus.COMPLETE
-            ]
+            completed = [t for t in transfers if t.status == TransferStatus.COMPLETE]
             assert len(completed) >= 3
 
             # Verify each file
