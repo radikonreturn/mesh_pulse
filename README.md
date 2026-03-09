@@ -34,7 +34,15 @@ Mesh-Pulse turns your terminal into a **Command Center** for your local network.
 
 ### 1. Installation
 
-Mesh-Pulse requires **Python 3.10+**. Clone the repository and install the dependencies:
+**Via NPM (Recommended)**
+You can easily install and run Mesh-Pulse globally using NPM:
+
+```bash
+npm install -g mesh-pulse
+```
+
+**Via Git (For Development)**
+Alternatively, clone the repository and install the Python dependencies directly:
 
 ```bash
 git clone https://github.com/radikonreturn/mesh_pulse.git
@@ -44,15 +52,28 @@ pip install -r requirements.txt
 
 ### 2. Running the Dashboard
 
-Start the application with default settings:
+If you installed via NPM globally, you can start the dashboard from anywhere:
+
+```bash
+mesh-pulse
+```
+
+Alternatively, you can run it via `npx` without installing:
+
+```bash
+npx mesh-pulse
+```
+
+**Running from Source (Python)**
+If you are running from the cloned repository:
 
 ```bash
 python -m mesh_pulse
 ```
 
-For advanced configuration, you can pass custom port settings:
+For advanced configuration, you can pass custom port settings (works identically for `mesh-pulse` and `python -m mesh_pulse`):
 ```bash
-python -m mesh_pulse --broadcast-port 9999 --transfer-port 10000
+mesh-pulse --broadcast-port 9999 --transfer-port 10000
 ```
 
 ---

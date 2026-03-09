@@ -1,0 +1,31 @@
+{
+    "name": "mesh-pulse",
+    "version": "1.0.0",
+    "description": "A TUI-based Network Mesh & System Resource Monitor",
+    "main": "bin/run.js",
+    "bin": {
+        "mesh-pulse": "./bin/run.js"
+    },
+    "scripts": {
+        "postinstall": "node bin/install.js"
+    },
+    "keywords": [
+        "tui",
+        "network",
+        "mesh",
+        "monitor",
+        "python",
+        "textual"
+    ],
+    "author": "Mesh-Pulse Team",
+    "license": "MIT",
+    "dependencies": {},
+    "files": [
+        "bin",
+        "mesh_pulse",
+        "requirements.txt",
+        "pyproject.toml",
+        "README.md",
+        "LICENSE"
+    ]
+}

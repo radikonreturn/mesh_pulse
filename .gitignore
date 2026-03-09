@@ -99,6 +99,7 @@ celerybeat.pid
 *.sage.py
 
 # --- Package Managers ---
+node_modules/
 # Pipfile.lock
 # uv.lock
 # poetry.lock
