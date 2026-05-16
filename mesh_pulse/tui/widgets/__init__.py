@@ -1,1 +1,1 @@
-"""Dashboard widgets: peer list, system health, transfer progress."""
+"""Dashboard widgets: peer list, system health, transfer progress, peer detail."""

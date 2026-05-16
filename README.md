@@ -1,142 +1,205 @@
-<div align="center">
-  <h1>⚡ Mesh-Pulse</h1>
-  <p><b>A lightweight, TUI-based Network Mesh & System Resource Monitor.</b></p>
+# Mesh-Pulse
 
-  [![Python CI](https://github.com/radikonreturn/mesh_pulse/actions/workflows/python-app.yml/badge.svg)](https://github.com/radikonreturn/mesh_pulse/actions)
-  [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-  [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/downloads/)
-</div>
+Mesh-Pulse is a terminal dashboard for local network awareness, system health,
+and encrypted file transfer. It uses a Textual TUI, UDP peer discovery, live
+resource monitoring, and TCP-based file transfers protected with AES-256-GCM.
 
-<br>
+## Features
 
-Mesh-Pulse turns your terminal into a **Command Center** for your local network. It automatically discovers peers, monitors system health in real-time, and transfers files securely with AES-256 encryption—all from a beautifully crafted Textual-based Dashboard UI.
+- Local peer discovery with UDP broadcast heartbeats.
+- Live CPU, memory, disk, network, and latency views.
+- Secure file transfer over TCP with encrypted chunk framing.
+- Multi-file send support through a single transfer session.
+- Transfer progress, history, retry handling, and file integrity checks.
+- Textual-based dashboard with peer details, event logs, settings, and a file
+  picker.
+- Persistent configuration through `~/.mesh_pulse_config.json`.
 
-![Mesh-Pulse Dashboard](https://github.com/radikonreturn/mesh_pulse/assets/placeholder-dashboard.png "Replace with actual screenshot")
+## Requirements
 
----
+- Python 3.10 or newer
+- A terminal that supports Textual applications
+- Network access between peers on the configured discovery and transfer ports
 
-## 🌟 Key Features
+Runtime dependencies are listed in `requirements.txt` and `pyproject.toml`.
 
-* **📡 Auto P2P Discovery** 
-  Zero-configuration peer detection on your local network using UDP broadcasts. Instantly see who is online.
-* **📊 Live System Monitoring** 
-  Real-time tracking of CPU usage, RAM capacity, Disk I/O, and Network metrics, displayed with live charts.
-* **🔒 Secure Fast File Transfer** 
-  TCP-based transfers protected by **AES-256-GCM** encryption. Transfer securely with real-time progress bars and speed tracking.
-* **📂 Advanced File Browser Modal** 
-  A built-in interactive file picker that allows selecting multiple files/folders, picking destinations, and resolving drive paths seamlessly inside the terminal.
-* **🎨 Stunning TUI Dashboard** 
-  Built on [Textual](https://textual.textualize.io/), featuring live-updating panels, an event log, toggle-able themes, and mouse support.
+## Install
 
----
-
-## 🚀 Quick Start
-
-### 1. Installation
-
-**Via NPM (Recommended)**
-You can easily install and run Mesh-Pulse globally using NPM:
+For local development:
 
 ```bash
-npm install -g mesh-pulse
-```
-
-**Via Git (For Development)**
-Alternatively, clone the repository and install the Python dependencies directly:
-
-```bash
-git clone https://github.com/radikonreturn/mesh_pulse.git
-cd mesh_pulse
+python -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
+pip install -e .
 ```
 
-### 2. Running the Dashboard
+On Windows PowerShell:
 
-If you installed via NPM globally, you can start the dashboard from anywhere:
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+pip install -e .
+```
+
+The package also includes npm wrapper metadata. If installed through npm, the
+`mesh-pulse` command delegates to the Python application.
+
+## Run
+
+From the source tree:
+
+```bash
+python -m mesh_pulse
+```
+
+After editable installation:
 
 ```bash
 mesh-pulse
 ```
 
-Alternatively, you can run it via `npx` without installing:
+Override ports when needed:
 
 ```bash
-npx mesh-pulse
+mesh-pulse --broadcast-port 37020 --transfer-port 5000
 ```
 
-**Running from Source (Python)**
-If you are running from the cloned repository:
+Set the transfer passphrase from the command line:
 
 ```bash
-python -m mesh_pulse
+mesh-pulse --key "shared-passphrase"
 ```
 
-For advanced configuration, you can pass custom port settings (works identically for `mesh-pulse` and `python -m mesh_pulse`):
-```bash
-mesh-pulse --broadcast-port 9999 --transfer-port 10000
+Every peer that should exchange files must use the same transfer passphrase.
+
+## Configuration
+
+Configuration priority is:
+
+1. CLI options
+2. Environment variables
+3. `~/.mesh_pulse_config.json`
+4. Built-in defaults
+
+Supported environment variables:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `MESH_PULSE_KEY` | `mesh-pulse-default-key` | Shared transfer passphrase |
+| `MESH_PULSE_BCAST_PORT` | `37020` | UDP discovery port |
+| `MESH_PULSE_XFER_PORT` | `5000` | TCP transfer port |
+| `MESH_PULSE_RECEIVE_DIR` | `~/mesh_pulse_received` | Directory for incoming files |
+
+Example config file:
+
+```json
+{
+  "broadcast_port": 37020,
+  "transfer_port": 5000,
+  "receive_dir": "~/mesh_pulse_received",
+  "default_key": "shared-passphrase"
+}
 ```
 
----
+The settings screen in the TUI can save these values. Restart the application
+after changing ports or the receive directory.
 
-## 📁 Sending Files
+## File Transfer
 
-1. Press `S` in the dashboard to open the **Send File Picker Modal**.
-2. Select your target **drive** and browse your local directories.
-3. Click on individual files or entire folders to selectively stage them for transfer.
-4. Select a **peer** from the dropdown (or type an IP manually).
-5. (Optional) Add a custom text message to accompany your transfer.
-6. Click **`✓ Send`**.
+Mesh-Pulse starts a transfer server when the dashboard opens. To send files,
+choose a peer, open the send dialog, select one or more files or folders, and
+start the transfer.
 
-### Custom Encryption Key
-Because transfers are highly encrypted via AES-256, both ends must have the exact same passphrase key to decode traffic. You can specify a custom shared passphrase by using an environment variable:
-```bash
-# Windows (PowerShell)
-$env:MESH_PULSE_KEY="my-super-secret"
-python -m mesh_pulse
+The transfer layer:
 
-# Linux/macOS
-MESH_PULSE_KEY="my-super-secret" python -m mesh_pulse
-```
-*(If unset, a default hardcoded demo key is used).*
+- derives a 32-byte AES key from the shared passphrase with PBKDF2-HMAC-SHA256;
+- encrypts headers and file chunks with AES-256-GCM;
+- frames encrypted payloads with length prefixes;
+- verifies received file hashes;
+- records send and receive progress;
+- retries failed sends with backoff.
 
----
+Incoming files are written to the configured receive directory.
 
-## ⌨️ Keyboard Shortcuts
-
-Navigate like a pro with the following bindings:
+## Keyboard Shortcuts
 
 | Key | Action |
-|-----|--------|
-| `Q` | **Quit** the application |
-| `S` | **Send File** — Opens the File Selection Modal |
-| `R` | **Refresh** — Force a UI refresh of peers/metrics |
-| `C` | **Clear Logs** — Wipes the event log history |
-| `D` | **Toggle Theme** — Switch between dark and light modes |
+| --- | --- |
+| `S` | Open the send-file dialog |
+| `P` | Show details for the most recent peer |
+| `O` | Open the received-files directory |
+| `G` | Open settings |
+| `R` | Refresh the dashboard |
+| `C` | Clear the event log |
+| `D` | Toggle dark/light theme |
+| `Q` | Quit |
 
----
-
-## 🏗️ Architecture
-
-Mesh-Pulse's codebase is heavily modularized for easy maintenance and expansion:
+## Project Layout
 
 ```text
 mesh_pulse/
-├── core/
-│   ├── discovery.py    # UDP Broadcast / Peer Management
-│   ├── engine.py       # Interconnects components (Hub)
-│   ├── monitor.py      # Cross-platform psutil system metrics
-│   └── transfer.py     # SECURE file streaming over TCP sockets
-├── tui/
-│   ├── dashboard.py    # Main textual visual layouts
-│   └── widgets/        # Specialized textual widgets (transfer bar, etc.)
-└── utils/
-    ├── crypto.py       # AES-GCM Encryption / Decryption routines
-    ├── config.py       # Ports, addresses, keys
-    └── logger.py       # Headless log outputs
+|-- app.py                  # Textual application and high-level UI actions
+|-- __main__.py             # click CLI entry point
+|-- core/
+|   |-- discovery.py        # UDP broadcast discovery and peer state
+|   |-- engine.py           # core subsystem startup helpers
+|   |-- monitor.py          # psutil-based system metrics
+|   `-- transfer.py         # encrypted TCP file transfer
+|-- tui/
+|   |-- dashboard.py        # main dashboard screen
+|   |-- screens/            # settings and secondary screens
+|   |-- styles/             # Textual CSS
+|   `-- widgets/            # peer, health, transfer, and log widgets
+`-- utils/
+    |-- config.py           # defaults, environment, and user config
+    |-- crypto.py           # encryption and socket framing helpers
+    `-- logger.py           # Rich logging setup
 ```
 
----
+Tests live in `tests/`.
 
-## 📄 License
+## Development
 
-This software is released under the [MIT License](LICENSE).
+Install dependencies and the package in editable mode:
+
+```bash
+pip install -r requirements.txt
+pip install -e .
+```
+
+Run the test suite:
+
+```bash
+pytest
+```
+
+Run lint and format checks:
+
+```bash
+ruff check .
+ruff format --check .
+```
+
+Run all configured pre-commit hooks:
+
+```bash
+pre-commit run --all-files
+```
+
+Some tests create localhost sockets. If your environment blocks socket creation,
+run the tests in a shell or sandbox that allows loopback TCP/UDP access.
+
+## Security Notes
+
+- Use a strong shared passphrase with `--key` or `MESH_PULSE_KEY`.
+- Keep discovery and transfer ports limited to trusted local networks.
+- Do not commit generated keys, logs, or received files.
+- Received file paths are handled defensively so incoming filenames cannot
+  intentionally write outside the receive directory.
+- Transfer integrity is checked with SHA-256 hashes.
+
+## License
+
+Mesh-Pulse is released under the MIT License. See [LICENSE](LICENSE).

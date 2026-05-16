@@ -2,9 +2,13 @@
 
 Verifies that the FileServer sanitizes incoming filenames so that
 a malicious sender cannot write files outside the receive directory.
+Uses the v2 AES-256-GCM JSON-framed protocol.
 """
 
+from __future__ import annotations
+
 import hashlib
+import json
 import os
 import shutil
 import socket
@@ -13,11 +17,22 @@ import time
 import pytest
 
 from mesh_pulse.core.transfer import FileServer
-from mesh_pulse.utils.crypto import fernet_encrypt, load_or_generate_key, pack_frame
+from mesh_pulse.utils.crypto import derive_session_key, encrypt_chunk, pack_frame
 
 
 TEST_PORT = 11000
+TEST_PASSPHRASE = "traversal-test-key"
 TEST_RECEIVE_DIR = "test_received_traversal"
+
+
+def _send_frame(sock: socket.socket, key: bytes, payload: dict | bytes) -> None:
+    """Helper: encrypt and send a length-prefixed frame (v2 protocol)."""
+    if isinstance(payload, dict):
+        raw = json.dumps(payload).encode("utf-8")
+    else:
+        raw = payload
+    encrypted = encrypt_chunk(raw, key)
+    sock.sendall(pack_frame(encrypted))
 
 
 @pytest.fixture
@@ -36,36 +51,47 @@ def clean_dirs():
 
 def test_path_traversal(clean_dirs):
     """Malicious filename with '../' must be sanitized to just the basename."""
-    key = load_or_generate_key()
+    key = derive_session_key(TEST_PASSPHRASE)
 
     server = FileServer(
         port=TEST_PORT,
         receive_dir=TEST_RECEIVE_DIR,
-        fernet_key=key,
+        passphrase=TEST_PASSPHRASE,
     )
     server.start()
-    time.sleep(0.5)  # Let the server bind
+    time.sleep(0.5)
 
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.connect(("127.0.0.1", TEST_PORT))
 
-        # Craft a malicious header with path traversal
         content = b"hacked content"
         file_hash = hashlib.sha256(content).hexdigest()
         malicious_filename = "../escaped_file.txt"
-        header_str = f"{malicious_filename}|{len(content)}|{file_hash}"
 
-        # Send Fernet-encrypted header (matching FileServer protocol)
-        enc_header = fernet_encrypt(header_str.encode("utf-8"), key)
-        sock.sendall(pack_frame(enc_header))
+        # ── v2 session header ──
+        _send_frame(sock, key, {"type": "session", "version": 2, "count": 1})
 
-        # Send Fernet-encrypted content chunk
-        enc_content = fernet_encrypt(content, key)
-        sock.sendall(pack_frame(enc_content))
+        # ── v2 file header with malicious filename ──
+        _send_frame(
+            sock,
+            key,
+            {
+                "type": "file",
+                "name": malicious_filename,
+                "size": len(content),
+                "sha256": file_hash,
+            },
+        )
+
+        # ── Data chunk ──
+        _send_frame(sock, key, content)
+
+        # ── FIN ──
+        _send_frame(sock, key, {"type": "fin"})
 
         sock.close()
-        time.sleep(1)  # Let server process
+        time.sleep(1.0)
 
         # The file must NOT escape the receive directory
         escaped_path = os.path.abspath("escaped_file.txt")
@@ -79,7 +105,7 @@ def test_path_traversal(clean_dirs):
             "Sanitized file was not created in the receive directory."
         )
 
-        # Verify content
+        # Verify content integrity
         with open(safe_path, "rb") as f:
             assert f.read() == content
 

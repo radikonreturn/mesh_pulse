@@ -3,7 +3,8 @@
 Architecture:
     - PeerDiscovery(Thread): single-threaded broadcaster + listener on UDP 37020
     - PeerManager: thread-safe registry of discovered peers (used by TUI widgets)
-    - UDPBroadcaster: legacy facade wrapping PeerDiscovery (used by app.py)
+    - LatencyProber: background TCP-connect latency measurement per peer
+    - UDPBroadcaster: facade wrapping PeerDiscovery (used by app.py)
 
 Peers auto-transition: ONLINE → STALE → removed, based on heartbeat age.
 """
@@ -23,6 +24,7 @@ from mesh_pulse.utils.config import (
     BROADCAST_INTERVAL,
     BROADCAST_PORT,
     HOSTNAME,
+    LATENCY_PROBE_INTERVAL,
     LOCAL_IP,
     PEER_DEAD_TIMEOUT,
     PEER_STALE_TIMEOUT,
@@ -67,6 +69,7 @@ class Peer:
     last_seen: float = field(default_factory=time.time)
     status: PeerStatus = PeerStatus.ONLINE
     metrics: PeerMetrics = field(default_factory=PeerMetrics)
+    latency_ms: float | None = None  # None = not yet measured
 
     @property
     def age(self) -> float:
@@ -80,7 +83,55 @@ class Peer:
             "port": self.port,
             "status": self.status.value,
             "age": round(self.age, 1),
+            "latency_ms": round(self.latency_ms, 1) if self.latency_ms is not None else None,
         }
+
+
+# ─── Latency Prober ────────────────────────────────────────────────
+
+
+class LatencyProber(threading.Thread):
+    """Background thread that measures real TCP round-trip latency to each peer.
+
+    For each known peer, attempts a TCP connect to the peer's transfer port and
+    records the wall-clock time.  Results are stored back on the Peer object.
+
+    Probes run every LATENCY_PROBE_INTERVAL seconds (default 5s).
+    """
+
+    def __init__(self, peer_manager: "PeerManager"):
+        super().__init__(daemon=True, name="latency-prober")
+        self._pm = peer_manager
+        self._running = threading.Event()
+        self._running.set()
+
+    def run(self) -> None:
+        while self._running.is_set():
+            self._probe_all()
+            self._running.wait(LATENCY_PROBE_INTERVAL)
+
+    def shutdown(self) -> None:
+        self._running.clear()
+
+    def _probe_all(self) -> None:
+        for peer in self._pm.get_peers():
+            if peer.status != PeerStatus.ONLINE:
+                continue
+            ms = self._tcp_ping(peer.ip, peer.port)
+            with self._pm._lock:
+                if peer.ip in self._pm._peers:
+                    self._pm._peers[peer.ip].latency_ms = ms
+
+    @staticmethod
+    def _tcp_ping(ip: str, port: int, timeout: float = 2.0) -> float | None:
+        """Attempt a TCP connect and return round-trip time in ms, or None."""
+        try:
+            start = time.perf_counter()
+            with socket.create_connection((ip, port), timeout=timeout):
+                pass
+            return (time.perf_counter() - start) * 1000.0
+        except (OSError, socket.timeout):
+            return None
 
 
 # ─── Peer Manager ──────────────────────────────────────────────────
@@ -182,7 +233,7 @@ class PeerDiscovery(threading.Thread):
     """Single-threaded UDP peer discovery.
 
     Acts as both a Broadcaster (sends JSON heartbeats every 2s) and a
-    Listener (binds to UDP port 37020). Discovered peers are stored in
+    Listener (binds to UDP port 37020).  Discovered peers are stored in
     a shared dict ``self.peers`` {IP: LastSeenTimestamp} and auto-removed
     if unseen for PEER_TIMEOUT seconds.
 
@@ -216,31 +267,33 @@ class PeerDiscovery(threading.Thread):
         self.peers: dict[str, float] = {}
         self._peers_lock = threading.Lock()
 
+        # Start latency prober if a PeerManager is provided
+        self._prober: LatencyProber | None = None
+        if peer_manager:
+            self._prober = LatencyProber(peer_manager)
+
     def run(self) -> None:
         """Main thread loop: broadcast, listen, and sweep concurrently."""
-        # Start a separate listener thread (uses select-style timeout)
+        if self._prober:
+            self._prober.start()
+
         listener = threading.Thread(
             target=self._listen_loop, daemon=True, name="udp-listen"
         )
         listener.start()
 
-        # This thread handles broadcasting + sweep
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         sock.settimeout(1.0)
 
         while self._running.is_set():
-            # ── Broadcast ──
             try:
                 beacon = self._build_beacon()
                 sock.sendto(beacon, (BROADCAST_ADDR, self._port))
             except OSError as e:
                 log.debug("Broadcast send error: %s", e)
 
-            # ── Sweep dead peers ──
             self._sweep_peers()
-
-            # ── Wait for next interval ──
             self._running.wait(self._interval)
 
         sock.close()
@@ -249,6 +302,8 @@ class PeerDiscovery(threading.Thread):
     def shutdown(self) -> None:
         """Signal the discovery thread to stop."""
         self._running.clear()
+        if self._prober:
+            self._prober.shutdown()
 
     def get_active_peers(self) -> dict[str, float]:
         """Return a copy of the active peers dict."""
@@ -289,17 +344,14 @@ class PeerDiscovery(threading.Thread):
                 data, addr = sock.recvfrom(4096)
                 beacon = json.loads(data.decode("utf-8"))
 
-                # Ignore our own beacons
                 if beacon.get("ip") == LOCAL_IP:
                     continue
 
                 peer_ip = beacon.get("ip", addr[0])
 
-                # Update shared peers dict
                 with self._peers_lock:
                     self.peers[peer_ip] = time.time()
 
-                # Also update PeerManager if attached (for TUI widgets)
                 if self._pm:
                     self._pm.update_peer(
                         hostname=beacon.get("hostname", "unknown"),
@@ -326,16 +378,15 @@ class PeerDiscovery(threading.Thread):
                 del self.peers[ip]
                 log.info("Peer auto-removed (timeout): %s", ip)
 
-        # Also sweep the PeerManager
         if self._pm:
             self._pm.sweep()
 
 
-# ─── UDPBroadcaster (Legacy facade for app.py) ────────────────────
+# ─── UDPBroadcaster (facade for app.py) ─────────────────────────
 
 
 class UDPBroadcaster:
-    """Legacy facade wrapping PeerDiscovery for backwards compatibility.
+    """Facade wrapping PeerDiscovery for backwards compatibility.
 
     Used by app.py and TUI. Delegates to PeerDiscovery internally.
 

@@ -1,10 +1,25 @@
-"""System health widget — sparklines, throughput gauges, and disk I/O.
+"""System health widget — sparklines, per-core CPU, throughput gauges, and disk I/O.
 
-Replaces static per-core list with ASCII sparklines for CPU/RAM trends,
-shows real-time network throughput (KB/s), and disk I/O read/write speed.
+Layout:
+    💻 SYSTEM HEALTH
+    CPU  ████░░░░░░  42.0%
+    RAM  ████████░░  78.3%
+    DISK ██░░░░░░░░  23.1%
+    RAM: 6.1 / 15.8 GB  │  Freq: 3200 MHz
+    ── Cores ──
+    0:▅ 1:▂ 2:▇ 3:▃  … (per-core mini-sparkline)
+    ── Trends (60s) ──
+    CPU (60s) ▁▂▃▄▅▆▇…
+    RAM (60s) ▁▁▂▂▃▃▄…
+    ── Throughput ──
+    NET  ↑ 1.2 MB/s  ↓ 3.4 MB/s
+    DISK R 0.0 B/s   W 128.0 KB/s
+    TEMP 72°C  (Linux/macOS only)
 """
 
 from __future__ import annotations
+
+import platform
 
 from rich.bar import Bar
 from rich.console import Group
@@ -15,7 +30,7 @@ from textual.widgets import Static
 from mesh_pulse.core.monitor import SystemMonitor
 
 
-# Sparkline characters (8-level Unicode block elements)
+# ── Sparkline helpers ────────────────────────────────────────────────
 SPARK_CHARS = "▁▂▃▄▅▆▇█"
 
 
@@ -33,20 +48,16 @@ def _sparkline(values: list[float], max_val: float = 100.0, width: int = 30) -> 
     if not values:
         return Text("─" * width, style="dim")
 
-    # Take the last `width` values
     data = values[-width:]
-
     chars = []
     for v in data:
         clamped = max(0.0, min(v, max_val))
         idx = int((clamped / max_val) * (len(SPARK_CHARS) - 1))
         chars.append(SPARK_CHARS[idx])
 
-    # Pad left if not enough data
     padding = width - len(chars)
     spark_str = "─" * padding + "".join(chars)
 
-    # Color based on latest value
     latest = data[-1] if data else 0
     if latest >= 90:
         color = "red"
@@ -60,6 +71,14 @@ def _sparkline(values: list[float], max_val: float = 100.0, width: int = 30) -> 
     return Text(spark_str, style=color)
 
 
+def _core_bar(percent: float) -> str:
+    """Single character representing a core load level."""
+    if not 0 <= percent <= 100:
+        return "─"
+    idx = int((percent / 100.0) * (len(SPARK_CHARS) - 1))
+    return SPARK_CHARS[idx]
+
+
 def _format_speed(bytes_per_sec: float) -> str:
     """Format bytes/sec into human-readable throughput."""
     if bytes_per_sec >= 1024 * 1024:
@@ -69,16 +88,26 @@ def _format_speed(bytes_per_sec: float) -> str:
     return f"{bytes_per_sec:.0f} B/s"
 
 
-class SystemHealthWidget(Static):
-    """Renders live system health with sparklines, throughput, and disk I/O.
+def _get_cpu_temp() -> str | None:
+    """Return a CPU temperature string if available, else None."""
+    if platform.system() == "Windows":
+        return None
+    try:
+        import psutil
+        temps = psutil.sensors_temperatures()
+        # Try common sensor names
+        for key in ("coretemp", "cpu_thermal", "k10temp", "acpitz"):
+            entries = temps.get(key, [])
+            if entries:
+                avg = sum(e.current for e in entries) / len(entries)
+                return f"{avg:.0f}°C"
+    except Exception:
+        pass
+    return None
 
-    Layout:
-        - CPU/RAM/Disk gauge bars with percentages
-        - CPU sparkline (60s trend)
-        - RAM sparkline (60s trend)
-        - Network throughput (real-time ↑/↓ speed)
-        - Disk I/O read/write speed
-    """
+
+class SystemHealthWidget(Static):
+    """Renders live system health with sparklines, per-core CPU, throughput, and disk I/O."""
 
     DEFAULT_CSS = """
     SystemHealthWidget {
@@ -100,7 +129,6 @@ class SystemHealthWidget(Static):
         m = self._monitor.latest
         history = self._monitor.history
 
-        # Extract history arrays for sparklines
         cpu_history = [h.cpu_percent for h in history]
         ram_history = [h.ram_percent for h in history]
 
@@ -133,58 +161,76 @@ class SystemHealthWidget(Static):
             style="dim white",
         )
 
-        # ── Sparklines ──
-        cpu_spark_label = Text.assemble(
-            ("  CPU ", "bold cyan"),
-            ("(60s) ", "dim"),
-        )
-        ram_spark_label = Text.assemble(
-            ("  RAM ", "bold magenta"),
-            ("(60s) ", "dim"),
-        )
-
-        # ── Network throughput (real-time) ──
-        net_text = Text.assemble(
-            ("  NET  ", "bold bright_green"),
-            ("↑ ", "green"),
-            (_format_speed(m.net_upload_speed), "bold green"),
-            ("  ", ""),
-            ("↓ ", "bright_cyan"),
-            (_format_speed(m.net_download_speed), "bold bright_cyan"),
-        )
-
-        # ── Disk I/O speed ──
-        disk_io_text = Text.assemble(
-            ("  DISK ", "bold blue"),
-            ("R ", "bright_cyan"),
-            (_format_speed(m.disk_read_speed), "bold bright_cyan"),
-            ("  ", ""),
-            ("W ", "bright_yellow"),
-            (_format_speed(m.disk_write_speed), "bold bright_yellow"),
-        )
-
-        # ── Assemble ──
-        header = Text("💻 SYSTEM HEALTH", style="bold cyan")
-
-        content = Group(
-            header,
+        # ── Per-core CPU ──
+        from rich.console import RenderableType
+        rows: list[RenderableType] = [
+            Text("💻 SYSTEM HEALTH", style="bold cyan"),
             Text(""),
             gauges,
             ram_detail,
             Text(""),
-            Text("  ─── Trends (60s) ───", style="dim bright_cyan"),
-            cpu_spark_label,
-            Text("  ") + _sparkline(cpu_history),
-            Text(""),
-            ram_spark_label,
-            Text("  ") + _sparkline(ram_history),
-            Text(""),
-            Text("  ─── Throughput ───", style="dim bright_cyan"),
-            net_text,
-            disk_io_text,
+        ]
+
+        if m.cpu_per_core:
+            core_line = Text("  ─── Cores ─── ", style="dim bright_cyan")
+            # Build a compact row: "0:▅ 1:▂ 2:▇ …"
+            core_parts: list[tuple[str, str]] = []
+            for i, pct in enumerate(m.cpu_per_core):
+                char = _core_bar(pct)
+                color = self._bar_color(pct)
+                core_parts.append((f"C{i}:", "dim"))
+                core_parts.append((char, f"bold {color}"))
+                core_parts.append(("  ", ""))
+            cores_text = Text.assemble(("  ", ""), *core_parts)
+            rows.extend([core_line, cores_text, Text("")])
+
+        # ── Sparklines ──
+        rows.append(Text("  ─── Trends (60s) ───", style="dim bright_cyan"))
+        rows.append(
+            Text.assemble(("  CPU ", "bold cyan"), ("(60s) ", "dim"))
+        )
+        rows.append(Text("  ") + _sparkline(cpu_history))
+        rows.append(Text(""))
+        rows.append(
+            Text.assemble(("  RAM ", "bold magenta"), ("(60s) ", "dim"))
+        )
+        rows.append(Text("  ") + _sparkline(ram_history))
+        rows.append(Text(""))
+
+        # ── Network throughput ──
+        rows.append(Text("  ─── Throughput ───", style="dim bright_cyan"))
+        rows.append(
+            Text.assemble(
+                ("  NET  ", "bold bright_green"),
+                ("↑ ", "green"),
+                (_format_speed(m.net_upload_speed), "bold green"),
+                ("  ", ""),
+                ("↓ ", "bright_cyan"),
+                (_format_speed(m.net_download_speed), "bold bright_cyan"),
+            )
+        )
+        rows.append(
+            Text.assemble(
+                ("  DISK ", "bold blue"),
+                ("R ", "bright_cyan"),
+                (_format_speed(m.disk_read_speed), "bold bright_cyan"),
+                ("  ", ""),
+                ("W ", "bright_yellow"),
+                (_format_speed(m.disk_write_speed), "bold bright_yellow"),
+            )
         )
 
-        self.update(content)
+        # ── Temperature (Linux/macOS) ──
+        temp = _get_cpu_temp()
+        if temp is not None:
+            rows.append(
+                Text.assemble(
+                    ("  TEMP ", "bold red"),
+                    (temp, "bold bright_red"),
+                )
+            )
+
+        self.update(Group(*rows))
 
     @staticmethod
     def _make_bar(percent: float, width: int = 16) -> Bar:

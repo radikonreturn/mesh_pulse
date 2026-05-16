@@ -9,6 +9,7 @@ from __future__ import annotations
 import ipaddress
 import os
 import platform
+import subprocess
 from pathlib import Path
 import psutil
 
@@ -31,10 +32,13 @@ from mesh_pulse.core.discovery import PeerManager, UDPBroadcaster
 from mesh_pulse.core.monitor import SystemMonitor
 from mesh_pulse.core.transfer import SecureTransfer, TransferInfo, TransferStatus
 from mesh_pulse.tui.dashboard import DashboardScreen
+from mesh_pulse.tui.screens.settings import SettingsScreen
 from mesh_pulse.tui.widgets.event_log import EventLog
+from mesh_pulse.tui.widgets.peer_detail import PeerDetailModal
 from mesh_pulse.utils.config import (
     BROADCAST_PORT,
     DEFAULT_KEY,
+    RECEIVE_DIR,
     TRANSFER_PORT,
 )
 from mesh_pulse.utils.logger import get_logger
@@ -251,10 +255,17 @@ class SendFileModal(ModalScreen):
         Binding("escape", "cancel", "Cancel", show=False),
     ]
 
-    def __init__(self, peer_ips: list[str], start_path: str = ".", **kwargs):
+    def __init__(
+        self,
+        peer_ips: list[str],
+        start_path: str = ".",
+        preselect_ip: str | None = None,
+        **kwargs,
+    ):
         super().__init__(**kwargs)
         self._peer_ips = peer_ips
         self._start_path = start_path
+        self._preselect_ip = preselect_ip
         self._selected_files: list[str] = []
         self._selected_folders: list[str] = []
 
@@ -318,8 +329,14 @@ class SendFileModal(ModalScreen):
         initial_drive = (
             self._start_path
             if any(d[1] == self._start_path for d in drives)
-            else (drives[0][1] if drives else Select.BLANK)
+            else (drives[0][1] if drives else Select.NULL)
         )
+
+        # Pre-selected IP value
+        from typing import Any
+        peer_value: Any = Select.NULL
+        if self._preselect_ip and self._preselect_ip in self._peer_ips:
+            peer_value = self._preselect_ip
 
         with Vertical(id="modal-box"):
             yield Static("📡  Initiate File Transfer", id="modal-title")
@@ -343,7 +360,12 @@ class SendFileModal(ModalScreen):
                 with Vertical(id="details-panel"):
                     # Recipient section
                     yield Static("🎯 Recipient", classes="section-label")
-                    yield Select(options, id="peer-select", prompt="Select a peer…")
+                    yield Select(
+                        options,
+                        id="peer-select",
+                        prompt="Select a peer…",
+                        value=peer_value,
+                    )
                     yield Static(
                         "── or enter IP manually ──", classes="section-divider"
                     )
@@ -427,7 +449,6 @@ class SendFileModal(ModalScreen):
         placeholder.display = False
         file_list.display = True
 
-        # Clear existing items
         file_list.clear()
 
         total_size = 0
@@ -480,7 +501,7 @@ class SendFileModal(ModalScreen):
     def on_select_changed(self, event: Select.Changed) -> None:
         """Handle dropdown changes."""
         if event.select.id == "drive-select":
-            if event.value is not Select.BLANK:
+            if event.value is not Select.NULL:
                 tree = self.query_one("#file-tree", DirectoryTree)
                 tree.path = str(event.value)
                 tree.reload()
@@ -495,7 +516,7 @@ class SendFileModal(ModalScreen):
     def _resolve_peer_ip(self) -> str | None:
         """Return the chosen peer IP from selector or manual input."""
         select = self.query_one("#peer-select", Select)
-        if select.value is not Select.BLANK and select.value != "__none__":
+        if select.value is not Select.NULL and select.value != "__none__":
             return str(select.value)
         manual = self.query_one("#manual-ip", Input).value.strip()
         if manual:
@@ -546,6 +567,9 @@ class MeshPulseApp(App):
     BINDINGS = [
         Binding("q", "quit", "Quit", priority=True),
         Binding("s", "send_file", "Send File"),
+        Binding("p", "peer_detail", "Peer Detail"),
+        Binding("o", "open_received", "Open Received"),
+        Binding("g", "settings", "Settings"),
         Binding("r", "refresh_all", "Refresh"),
         Binding("c", "clear_logs", "Clear Logs"),
         Binding("d", "toggle_dark", "Toggle Dark"),
@@ -571,6 +595,7 @@ class MeshPulseApp(App):
         self.transfer = SecureTransfer(
             passphrase=passphrase,
             transfer_port=transfer_port,
+            receive_dir=RECEIVE_DIR,
             on_file_received=self._on_file_received,
         )
 
@@ -592,16 +617,15 @@ class MeshPulseApp(App):
             level = "error"
             severity = "warning"
 
-        # Thread-safe: schedule on the Textual event loop
         try:
             self.call_from_thread(self.event_log.log, msg, level)
             self.call_from_thread(self.notify, msg, severity=severity)
         except Exception:
-            pass  # App may be shutting down
+            pass
 
     def on_mount(self) -> None:
         """Start all background subsystems when the app mounts."""
-        self.event_log.log("Mesh-Pulse starting up...", "info")
+        self.event_log.log("Mesh-Pulse starting up…", "info")
         self.monitor.start()
         self.event_log.log("System monitor active", "success")
         self.broadcaster.start()
@@ -623,10 +647,12 @@ class MeshPulseApp(App):
         self.event_log.log("Dashboard loaded — all systems operational", "success")
         log.info("Dashboard loaded — all systems operational")
 
-    def action_toggle_dark(self) -> None:
-        self.dark = not self.dark
+    # ── Actions ────────────────────────────────────────────────────
 
-    def action_send_file(self) -> None:
+    def action_toggle_dark(self) -> None:
+        self.theme = "textual-light" if self.theme == "textual-dark" else "textual-dark"
+
+    def action_send_file(self, preselect_ip: str | None = None) -> None:
         """Open the file picker modal populated with discovered peers."""
         peers = self.peer_manager.get_peers()
         peer_ips = [p.ip for p in peers]
@@ -634,7 +660,6 @@ class MeshPulseApp(App):
         def _on_result(result: tuple[str, list[str], str] | None) -> None:
             if result:
                 peer_ip, items, message = result
-                # Expand folders into individual files
                 all_files: list[str] = []
                 for item in items:
                     if os.path.isdir(item):
@@ -649,16 +674,62 @@ class MeshPulseApp(App):
                     count = len(all_files)
                     msg = f"Started sending {count} file{'s' if count > 1 else ''} to {peer_ip}"
                     if message:
-                        msg += f" with message: {message}"
+                        msg += f' with message: "{message}"'
                     self.event_log.log(msg, "info")
                     self.notify(msg, severity="information")
                 else:
                     self.event_log.log("No valid files found to send", "error")
 
         self.push_screen(
-            SendFileModal(peer_ips=peer_ips, start_path=os.path.abspath(os.sep)),
+            SendFileModal(
+                peer_ips=peer_ips,
+                start_path=os.path.abspath(os.sep),
+                preselect_ip=preselect_ip,
+            ),
             callback=_on_result,
         )
+
+    def action_peer_detail(self) -> None:
+        """Open Peer Detail modal for the most-recently-seen online peer."""
+        peers = [
+            p
+            for p in self.peer_manager.get_peers()
+            if p.status.value == "online"
+        ]
+        if not peers:
+            self.notify("No online peers to inspect", severity="warning")
+            return
+
+        # Show the most recently seen peer
+        peer = sorted(peers, key=lambda p: p.last_seen, reverse=True)[0]
+
+        def _on_peer_result(result: str | None) -> None:
+            if result:
+                # User clicked "Send File" from the peer detail modal
+                self.action_send_file(preselect_ip=result)
+
+        self.push_screen(PeerDetailModal(peer=peer), callback=_on_peer_result)
+
+    def action_open_received(self) -> None:
+        """Open the received-files folder in the system file explorer."""
+        folder = Path(RECEIVE_DIR)
+        folder.mkdir(parents=True, exist_ok=True)
+
+        try:
+            if platform.system() == "Windows":
+                os.startfile(str(folder))  # type: ignore[attr-defined]
+            elif platform.system() == "Darwin":
+                subprocess.Popen(["open", str(folder)])
+            else:
+                subprocess.Popen(["xdg-open", str(folder)])
+            self.event_log.log(f"Opened received files folder: {folder}", "info")
+        except Exception as e:
+            self.event_log.log(f"Could not open folder: {e}", "error")
+            self.notify(str(folder), title="Received Files Folder", severity="information")
+
+    def action_settings(self) -> None:
+        """Open the Settings screen."""
+        self.push_screen(SettingsScreen())
 
     def action_refresh_all(self) -> None:
         self.refresh()
@@ -671,7 +742,7 @@ class MeshPulseApp(App):
         self.notify("Logs cleared", severity="information")
 
     def on_unmount(self) -> None:
-        log.info("Mesh-Pulse shutting down...")
+        log.info("Mesh-Pulse shutting down…")
         self.broadcaster.stop()
         self.monitor.stop()
         self.transfer.stop_server()

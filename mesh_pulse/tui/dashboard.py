@@ -71,6 +71,6 @@ class DashboardScreen(Screen):
 
         # Sticky footer with keyboard shortcuts
         yield Static(
-            "  [R] Refresh  │  [S] Send File  │  [C] Clear Logs  │  [Q] Quit",
+            "  [S] Send  │  [P] Peer Detail  │  [O] Open Received  │  [G] Settings  │  [R] Refresh  │  [C] Clear  │  [D] Theme  │  [Q] Quit",
             id="footer",
         )

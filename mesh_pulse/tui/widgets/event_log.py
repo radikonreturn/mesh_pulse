@@ -131,7 +131,8 @@ class EventLogWidget(Static):
             self.update(content)
             return
 
-        rows = [header, Text("")]
+        from rich.console import RenderableType
+        rows: list[RenderableType] = [header, Text("")]
 
         for ts, level, message in reversed(events):
             t = time.strftime("%H:%M:%S", time.localtime(ts))

@@ -1,6 +1,7 @@
 """Peer list widget — live-updating table of discovered network nodes.
 
 Columns: Status indicator, Hostname, IP Address, CPU, RAM, Latency, Last Seen.
+Latency values come from LatencyProber (real TCP connect-time measurements).
 """
 
 from __future__ import annotations
@@ -13,8 +14,8 @@ from mesh_pulse.core.discovery import Peer, PeerManager, PeerStatus
 
 
 class PeerListWidget(Static):
-    """Displays a live list of discovered peers with status indicators,
-    latency, and last-seen timestamps.
+    """Displays a live list of discovered peers with real latency measurements,
+    status indicators, remote metrics, and last-seen timestamps.
     """
 
     DEFAULT_CSS = """
@@ -53,13 +54,14 @@ class PeerListWidget(Static):
         table.add_column("Status", justify="center", width=8, no_wrap=True)
         table.add_column("CPU", justify="right", width=5)
         table.add_column("RAM", justify="right", width=5)
-        table.add_column("Latency", justify="right", width=7)
+        table.add_column("Latency", justify="right", width=9)
         table.add_column("Last Seen", justify="right", width=9, no_wrap=True)
 
         if not peers:
             table.add_row(
                 "",
                 Text("Scanning network...", style="dim italic"),
+                "",
                 "",
                 "",
                 "",
@@ -78,12 +80,7 @@ class PeerListWidget(Static):
                     f"{peer.metrics.ram_percent:.0f}%",
                     style=self._load_color(peer.metrics.ram_percent),
                 )
-                # Simulated latency based on age (real ping would need ICMP)
-                latency_ms = min(peer.age * 10, 999)
-                latency_text = Text(
-                    f"{latency_ms:.0f}ms",
-                    style=self._latency_color(latency_ms),
-                )
+                latency_text = self._format_latency(peer.latency_ms)
                 last_seen = self._format_last_seen(peer.age)
 
                 table.add_row(
@@ -112,6 +109,13 @@ class PeerListWidget(Static):
         return Text("STALE", style="bold red")
 
     @staticmethod
+    def _format_latency(ms: float | None) -> Text:
+        """Format real TCP latency measurement."""
+        if ms is None:
+            return Text("probing…", style="dim")
+        return Text(f"{ms:.0f} ms", style=PeerListWidget._latency_color(ms))
+
+    @staticmethod
     def _format_last_seen(age: float) -> Text:
         if age < 60:
             return Text(f"{age:.0f}s ago", style="dim bright_white")
@@ -121,9 +125,11 @@ class PeerListWidget(Static):
 
     @staticmethod
     def _latency_color(ms: float) -> str:
-        if ms < 50:
+        if ms < 5:
+            return "bold bright_green"
+        elif ms < 30:
             return "bold green"
-        elif ms < 150:
+        elif ms < 100:
             return "bold yellow"
         return "bold red"
 
