@@ -1,28 +1,46 @@
-# Use official Python runtime as a parent image
-FROM python:3.10-slim
+# Stage 1: Build dependencies
+FROM python:3.11-slim as builder
 
-# Set environment variables
+# Set environment variables for build
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
-ENV TERM=xterm-256color
 
-# Set working directory
-WORKDIR /app
+WORKDIR /build
 
-# Install system dependencies (needed for psutil and network tools)
+# Install system dependencies required for building python packages (like psutil)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     python3-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements and build wheels
+COPY requirements.txt .
+RUN pip wheel --no-cache-dir --no-deps --wheel-dir /build/wheels -r requirements.txt
+
+# Stage 2: Final runtime image
+FROM python:3.11-slim
+
+# Set runtime environment variables
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    TERM=xterm-256color
+
+WORKDIR /app
+
+# Install only runtime dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
     iproute2 \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements first to leverage Docker cache
-COPY requirements.txt .
+# Copy wheels from the builder stage
+COPY --from=builder /build/wheels /wheels
+COPY --from=builder /build/requirements.txt .
 
-# Install Python dependencies
-RUN pip install --no-cache-dir -r requirements.txt
+# Install dependencies from the pre-built wheels
+RUN pip install --no-cache-dir --no-index --find-links=/wheels -r requirements.txt \
+    && rm -rf /wheels
 
-# Copy the rest of the application
+# Copy the rest of the application code
 COPY . .
 
 # Expose ports
@@ -32,4 +50,4 @@ EXPOSE 37020/udp
 EXPOSE 5000/tcp
 
 # Run the application
-ENTRYPOINT ["python", "-m", "mesh_pulse"]
+CMD ["python", "-m", "mesh_pulse"]

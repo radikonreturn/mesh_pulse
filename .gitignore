@@ -140,6 +140,8 @@ panel_output.txt
 # --- AI Editor Config ---
 .cursorignore
 .cursorindexingignore
+AGENTS.md
+GEMINI.md
 
 # --- PyPI ---
 .pypirc
