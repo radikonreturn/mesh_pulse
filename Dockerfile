@@ -1,46 +1,44 @@
-# Stage 1: Build dependencies
-FROM python:3.11-slim as builder
+# Stage 1: Build stage
+FROM python:3.11-slim AS builder
 
-# Set environment variables for build
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 
 WORKDIR /build
 
-# Install system dependencies required for building python packages (like psutil)
+# Install system dependencies required for building python wheels
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     python3-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements and build wheels
-COPY requirements.txt .
-RUN pip wheel --no-cache-dir --no-deps --wheel-dir /build/wheels -r requirements.txt
+# Copy project definition and source code
+COPY pyproject.toml requirements.txt README.md ./
+COPY mesh_pulse ./mesh_pulse
 
-# Stage 2: Final runtime image
+# Build wheels for app and all transitive dependencies
+RUN pip wheel --no-cache-dir --wheel-dir /build/wheels -r requirements.txt .
+
+# Stage 2: Runtime stage
 FROM python:3.11-slim
 
-# Set runtime environment variables
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     TERM=xterm-256color
 
 WORKDIR /app
 
-# Install only runtime dependencies
+# Install runtime system packages
 RUN apt-get update && apt-get install -y --no-install-recommends \
     iproute2 \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy wheels from the builder stage
+# Copy and install wheels
 COPY --from=builder /build/wheels /wheels
-COPY --from=builder /build/requirements.txt .
-
-# Install dependencies from the pre-built wheels
-RUN pip install --no-cache-dir --no-index --find-links=/wheels -r requirements.txt \
+RUN pip install --no-cache-dir --no-index --find-links=/wheels mesh-pulse \
     && rm -rf /wheels
 
-# Copy the rest of the application code
+# Copy remaining project files
 COPY . .
 
 # Expose ports
@@ -50,4 +48,4 @@ EXPOSE 37020/udp
 EXPOSE 5000/tcp
 
 # Run the application
-CMD ["python", "-m", "mesh_pulse"]
+CMD ["python", "-m", "mesh_pulse"]
