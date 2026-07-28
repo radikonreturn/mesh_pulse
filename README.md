@@ -1,8 +1,33 @@
 # Mesh-Pulse
 
-Mesh-Pulse is a terminal dashboard for local network awareness, system health,
-and encrypted file transfer. It uses a Textual TUI, UDP peer discovery, live
-resource monitoring, and TCP-based file transfers protected with AES-256-GCM.
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![PyPI](https://img.shields.io/badge/pypi-not%20yet%20published-lightgrey)](#)
+
+**A terminal dashboard for your LAN: see every peer on your network, watch live system health, and send encrypted files — all without a GUI, an account, or a cloud server.**
+
+<!--
+DEMO GIF GOES HERE — this is the single highest-impact thing you can add.
+Record a 10-15s clip with asciinema (https://asciinema.org/) or terminalizer
+showing: app opens -> peer appears -> file sent -> received.
+Convert asciinema to gif with agg, then:
+![demo](docs/demo.gif)
+-->
+
+---
+
+## Why Mesh-Pulse?
+
+| | Mesh-Pulse | Syncthing | scp / rsync | LocalSend |
+|---|---|---|---|---|
+| Setup | zero-config, just run it | config + web UI | manual host/key setup | GUI app install |
+| Interface | terminal (TUI) | web browser | terminal (no UI) | GUI |
+| Peer discovery | automatic (UDP broadcast) | automatic | manual (you type the IP) | automatic |
+| Live system stats | ✅ built in | ❌ | ❌ | ❌ |
+| Encryption | AES-256-GCM | TLS | SSH | TLS |
+| Best for | quick ad-hoc transfers + LAN visibility from the terminal | continuous folder sync | scripted/automated transfers | non-technical GUI users |
+
+If you live in a terminal and want to glance at your network and fire off a file without opening a browser or remembering an IP, that's the gap Mesh-Pulse fills.
 
 ## Features
 
@@ -11,8 +36,7 @@ resource monitoring, and TCP-based file transfers protected with AES-256-GCM.
 - Secure file transfer over TCP with encrypted chunk framing.
 - Multi-file send support through a single transfer session.
 - Transfer progress, history, retry handling, and file integrity checks.
-- Textual-based dashboard with peer details, event logs, settings, and a file
-  picker.
+- Textual-based dashboard with peer details, event logs, settings, and a file picker.
 - Persistent configuration through `~/.mesh_pulse_config.json`.
 
 ## Requirements
@@ -43,8 +67,7 @@ pip install -r requirements.txt
 pip install -e .
 ```
 
-The package also includes npm wrapper metadata. If installed through npm, the
-`mesh-pulse` command delegates to the Python application.
+The package also includes npm wrapper metadata. If installed through npm, the `mesh-pulse` command delegates to the Python application.
 
 ## Run
 
@@ -86,7 +109,7 @@ Configuration priority is:
 Supported environment variables:
 
 | Variable | Default | Purpose |
-| --- | --- | --- |
+|---|---|---|
 | `MESH_PULSE_KEY` | `mesh-pulse-default-key` | Shared transfer passphrase |
 | `MESH_PULSE_BCAST_PORT` | `37020` | UDP discovery port |
 | `MESH_PULSE_XFER_PORT` | `5000` | TCP transfer port |
@@ -103,14 +126,11 @@ Example config file:
 }
 ```
 
-The settings screen in the TUI can save these values. Restart the application
-after changing ports or the receive directory.
+The settings screen in the TUI can save these values. Restart the application after changing ports or the receive directory.
 
 ## File Transfer
 
-Mesh-Pulse starts a transfer server when the dashboard opens. To send files,
-choose a peer, open the send dialog, select one or more files or folders, and
-start the transfer.
+Mesh-Pulse starts a transfer server when the dashboard opens. To send files, choose a peer, open the send dialog, select one or more files or folders, and start the transfer.
 
 The transfer layer:
 
@@ -126,7 +146,7 @@ Incoming files are written to the configured receive directory.
 ## Keyboard Shortcuts
 
 | Key | Action |
-| --- | --- |
+|---|---|
 | `S` | Open the send-file dialog |
 | `P` | Show details for the most recent peer |
 | `O` | Open the received-files directory |
@@ -138,7 +158,7 @@ Incoming files are written to the configured receive directory.
 
 ## Project Layout
 
-```text
+```
 mesh_pulse/
 |-- app.py                  # Textual application and high-level UI actions
 |-- __main__.py             # click CLI entry point
@@ -188,17 +208,19 @@ Run all configured pre-commit hooks:
 pre-commit run --all-files
 ```
 
-Some tests create localhost sockets. If your environment blocks socket creation,
-run the tests in a shell or sandbox that allows loopback TCP/UDP access.
+Some tests create localhost sockets. If your environment blocks socket creation, run the tests in a shell or sandbox that allows loopback TCP/UDP access.
 
 ## Security Notes
 
 - Use a strong shared passphrase with `--key` or `MESH_PULSE_KEY`.
 - Keep discovery and transfer ports limited to trusted local networks.
 - Do not commit generated keys, logs, or received files.
-- Received file paths are handled defensively so incoming filenames cannot
-  intentionally write outside the receive directory.
+- Received file paths are handled defensively so incoming filenames cannot intentionally write outside the receive directory.
 - Transfer integrity is checked with SHA-256 hashes.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
