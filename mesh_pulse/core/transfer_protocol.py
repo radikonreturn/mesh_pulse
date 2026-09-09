@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import socket
 from dataclasses import dataclass
@@ -80,8 +81,17 @@ def validate_session_header(
     return count, message
 
 
-def validate_filename(value: object) -> str:
-    """Validate a portable basename supplied by an untrusted peer."""
+def _is_reserved_filename(name: str) -> bool:
+    if hasattr(os.path, "isreserved"):
+        return os.path.isreserved(name)
+    try:
+        return PureWindowsPath(name).is_reserved()
+    except Exception:
+        return False
+
+
+def sanitize_filename(value: str) -> str:
+    """Validate remote file basenames defensively against path injection."""
     if (
         not isinstance(value, str)
         or not value
@@ -95,11 +105,18 @@ def validate_filename(value: object) -> str:
     if (
         Path(value).name != value
         or windows_path.name != value
-        or windows_path.is_reserved()
+        or _is_reserved_filename(value)
         or value in {".", ".."}
     ):
         raise ProtocolError("Invalid filename")
     return value
+
+
+def validate_filename(value: object) -> str:
+    """Validate a portable basename supplied by an untrusted peer."""
+    if not isinstance(value, str):
+        raise ProtocolError("Invalid filename")
+    return sanitize_filename(value)
 
 
 def validate_file_header(header: dict) -> tuple[str, int, str]:

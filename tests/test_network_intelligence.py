@@ -93,3 +93,115 @@ def test_interface_selection_excludes_loopback_down_and_duplicates(monkeypatch):
     assert [(item.address, item.broadcast) for item in interfaces] == [
         ("192.0.2.2", "192.0.2.255")
     ]
+
+
+def test_transfer_complete_increments_success_stats():
+    manager = PeerManager()
+    manager.update_peer("peer", "192.0.2.10", 5000)
+    peer = manager.get_peer("192.0.2.10")
+    assert peer.successful_transfers == 0
+    assert peer.failed_transfers == 0
+    assert peer.connection_failures == 0
+
+    manager.record_transfer_result("192.0.2.10", success=True)
+    assert peer.successful_transfers == 1
+    assert peer.failed_transfers == 0
+    assert peer.connection_failures == 0
+    assert peer_health(peer) == "Good"
+
+
+def test_transfer_failed_increments_failure_stats():
+    manager = PeerManager()
+    manager.update_peer("peer", "192.0.2.10", 5000)
+    peer = manager.get_peer("192.0.2.10")
+
+    # Connection failure increments both failed_transfers and connection_failures
+    manager.record_transfer_result("192.0.2.10", success=False, connection_failure=True)
+    assert peer.successful_transfers == 0
+    assert peer.failed_transfers == 1
+    assert peer.connection_failures == 1
+
+    # Non-connection failure increments failed_transfers but not connection_failures
+    manager.record_transfer_result(
+        "192.0.2.10", success=False, connection_failure=False
+    )
+    assert peer.successful_transfers == 0
+    assert peer.failed_transfers == 2
+    assert peer.connection_failures == 1
+
+
+def test_app_transfer_event_rejected_and_cancelled_do_not_degrade_health():
+    from mesh_pulse.app import MeshPulseApp
+    from mesh_pulse.core.events import TransferCompleted, TransferFailed
+    from mesh_pulse.core.transfer_models import (
+        TransferDirection,
+        TransferInfo,
+        TransferStatus,
+    )
+
+    # Use an uninitialized app instance to test event dispatch in isolation
+    app = MeshPulseApp.__new__(MeshPulseApp)
+    app.peer_manager = PeerManager()
+    app.peer_manager.update_peer("peer", "192.0.2.10", 5000)
+    peer = app.peer_manager.get_peer("192.0.2.10")
+
+    # REJECTED transfer: must not count as failure
+    rejected_info = TransferInfo(
+        filename="test.txt",
+        filesize=100,
+        direction=TransferDirection.SEND,
+        peer_ip="192.0.2.10",
+        status=TransferStatus.REJECTED,
+        error="Transfer rejected by peer.",
+    )
+    app._on_transfer_event(TransferFailed(rejected_info))
+    assert peer.successful_transfers == 0
+    assert peer.failed_transfers == 0
+    assert peer.connection_failures == 0
+    assert peer_health(peer) == "Good"
+
+    # CANCELLED transfer: must not count as failure
+    cancelled_info = TransferInfo(
+        filename="test.txt",
+        filesize=100,
+        direction=TransferDirection.SEND,
+        peer_ip="192.0.2.10",
+        status=TransferStatus.CANCELLED,
+        error="Transfer cancelled by user.",
+    )
+    app._on_transfer_event(TransferFailed(cancelled_info))
+    assert peer.successful_transfers == 0
+    assert peer.failed_transfers == 0
+    assert peer.connection_failures == 0
+    assert peer_health(peer) == "Good"
+
+    # COMPLETED transfer: increments success
+    completed_info = TransferInfo(
+        filename="test.txt",
+        filesize=100,
+        direction=TransferDirection.SEND,
+        peer_ip="192.0.2.10",
+        status=TransferStatus.COMPLETE,
+    )
+    app._on_transfer_event(TransferCompleted(completed_info))
+    assert peer.successful_transfers == 1
+    assert peer.failed_transfers == 0
+    assert peer.connection_failures == 0
+    assert peer_health(peer) == "Good"
+
+    # FAILED transfer with connection error: increments connection failure
+    failed_info = TransferInfo(
+        filename="test.txt",
+        filesize=100,
+        direction=TransferDirection.SEND,
+        peer_ip="192.0.2.10",
+        status=TransferStatus.FAILED,
+        error="Unable to connect to peer.",
+    )
+    app._on_transfer_event(TransferFailed(failed_info))
+    app._on_transfer_event(TransferFailed(failed_info))
+    app._on_transfer_event(TransferFailed(failed_info))
+    assert peer.failed_transfers == 3
+    assert peer.connection_failures == 3
+    # 3 connection failures > 1 success + 1 -> peer becomes Unstable
+    assert peer_health(peer) == "Unstable"

@@ -5,12 +5,38 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "mesh-pulse"
 version = "1.0.0"
-description = "A TUI-based Network Mesh & System Resource Monitor"
+description = "Terminal-first local peer discovery, trusted device pairing, and authenticated encrypted file transfer utility"
 readme = "README.md"
 requires-python = ">=3.10"
-license = {text = "MIT"}
+license = "MIT"
 authors = [
     {name = "Mesh-Pulse Team"}
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Communications :: File Distribution",
+    "Topic :: System :: Networking",
+    "Topic :: System :: Monitoring",
+]
+keywords = [
+    "tui",
+    "terminal",
+    "mesh",
+    "networking",
+    "p2p",
+    "file-transfer",
+    "encryption",
+    "ed25519",
+    "aes-256-gcm",
 ]
 dependencies = [
     "textual>=0.47.0",
@@ -21,11 +47,25 @@ dependencies = [
     "platformdirs>=3.6.0",
 ]
 
+[project.urls]
+Homepage = "https://github.com/radikonreturn/mesh_pulse"
+Repository = "https://github.com/radikonreturn/mesh_pulse"
+Issues = "https://github.com/radikonreturn/mesh_pulse/issues"
+
 [project.scripts]
 mesh-pulse = "mesh_pulse.__main__:main"
 
+[tool.setuptools]
+include-package-data = true
+
 [tool.setuptools.packages.find]
 include = ["mesh_pulse*"]
+
+[tool.setuptools.package-data]
+"mesh_pulse" = [
+    "tui/styles/*.tcss",
+    "py.typed",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

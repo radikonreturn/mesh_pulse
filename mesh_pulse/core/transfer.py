@@ -323,7 +323,11 @@ class FileServer(threading.Thread):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
-            handler.join(timeout=remaining)
+            try:
+                if handler.is_alive():
+                    handler.join(timeout=remaining)
+            except RuntimeError:
+                pass
 
     def _session_worker(self, conn: socket.socket, peer_ip: str) -> None:
         try:

@@ -39,6 +39,8 @@ MANIFEST
 # --- PyInstaller ---
 *.manifest
 *.spec
+!mesh_pulse.spec
+!packaging/*.spec
 
 # --- Installer Logs ---
 pip-log.txt
@@ -133,9 +135,24 @@ Desktop.ini
 # --- Documentation ---
 /site
 
-# --- Project Specific ---
+# --- Project Specific & Security-Sensitive Data ---
 received_files/
+received_transfers/
 panel_output.txt
+.mesh_pulse/
+.mesh-pulse/
+.mesh-pulse-partials/
+*.part
+identity.json
+identity.key
+trust.json
+history.db
+history.db-journal
+history.db-wal
+history.db-shm
+*.log
+.env
+.env.*
 
 # --- AI Editor Config ---
 .cursorignore

@@ -33,8 +33,18 @@ from mesh_pulse.utils.config import BROADCAST_PORT, TRANSFER_PORT
     type=int,
     help=f"TCP transfer port (default: {TRANSFER_PORT}).",
 )
+@click.option(
+    "--demo",
+    is_flag=True,
+    help="Run an isolated local showcase with mock peers and transfer data (no network traffic).",
+)
 @click.version_option(version=__version__, prog_name="mesh-pulse")
-def main(key: str | None, broadcast_port: int, transfer_port: int) -> None:
+def main(
+    key: str | None,
+    broadcast_port: int,
+    transfer_port: int,
+    demo: bool = False,
+) -> None:
     """Mesh-Pulse — local encrypted peer workspace."""
     from mesh_pulse.app import MeshPulseApp
 
@@ -42,6 +52,7 @@ def main(key: str | None, broadcast_port: int, transfer_port: int) -> None:
         passphrase=key,
         broadcast_port=broadcast_port,
         transfer_port=transfer_port,
+        demo_mode=demo,
     )
     app.run()
 

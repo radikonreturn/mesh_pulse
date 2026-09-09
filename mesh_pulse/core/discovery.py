@@ -722,7 +722,13 @@ class PeerManager:
                     peer.latency_ms = float(latency_ms)
                     peer.latency_updated_at = time.time()
 
-    def record_transfer_result(self, identifier: str, *, success: bool) -> None:
+    def record_transfer_result(
+        self,
+        identifier: str,
+        *,
+        success: bool,
+        connection_failure: bool = True,
+    ) -> None:
         """Record a bounded runtime transfer outcome for explainable health."""
         with self._lock:
             peer = next(
@@ -739,7 +745,8 @@ class PeerManager:
                 peer.successful_transfers += 1
             else:
                 peer.failed_transfers += 1
-                peer.connection_failures += 1
+                if connection_failure:
+                    peer.connection_failures += 1
             peer.last_transfer_at = time.time()
 
     def network_overview(self, *, active_transfers: int = 0) -> NetworkOverview:
@@ -764,6 +771,13 @@ class PeerManager:
                 else TrustStatus.NEW
             )
             return peer.trust_status
+
+    def add_demo_peer(self, peer: Peer) -> None:
+        """Register a peer directly for isolated showcase/demo usage."""
+        with self._lock:
+            self._peers[peer.ip] = peer
+        if self._on_peer_change:
+            self._on_peer_change()
 
     @property
     def count(self) -> int:

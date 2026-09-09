@@ -10,6 +10,7 @@ import ipaddress
 import os
 import platform
 import subprocess
+import sys
 from pathlib import Path
 from typing import ClassVar
 
@@ -592,6 +593,31 @@ class SendFileModal(ModalScreen):
         self.dismiss(None)
 
 
+def _resolve_css_path() -> Path:
+    """Resolve dashboard.tcss path across source checkout, wheel install, and PyInstaller."""
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        meipass_dir = Path(sys._MEIPASS)
+        candidate = meipass_dir / "mesh_pulse" / "tui" / "styles" / "dashboard.tcss"
+        if candidate.exists():
+            return candidate
+        candidate_flat = meipass_dir / "tui" / "styles" / "dashboard.tcss"
+        if candidate_flat.exists():
+            return candidate_flat
+    default_path = Path(__file__).resolve().parent / "tui" / "styles" / "dashboard.tcss"
+    if default_path.exists():
+        return default_path
+    try:
+        from importlib.resources import files
+
+        res_file = files("mesh_pulse").joinpath("tui", "styles", "dashboard.tcss")
+        as_path = Path(str(res_file))
+        if as_path.exists():
+            return as_path
+    except Exception:
+        pass
+    return default_path
+
+
 # ── Main Application ───────────────────────────────────────────────
 
 
@@ -600,7 +626,7 @@ class MeshPulseApp(App):
 
     TITLE = "Mesh-Pulse"
     SUB_TITLE = "Local encrypted peer workspace"
-    CSS_PATH = Path(__file__).parent / "tui" / "styles" / "dashboard.tcss"
+    CSS_PATH = _resolve_css_path()
 
     BINDINGS: ClassVar[list[Binding]] = [
         Binding("q", "quit", "Quit", priority=True),
@@ -621,9 +647,18 @@ class MeshPulseApp(App):
         broadcast_port: int = BROADCAST_PORT,
         transfer_port: int = TRANSFER_PORT,
         identity_directory: str | Path | None = None,
+        demo_mode: bool = False,
         **kwargs,
     ):
         super().__init__(**kwargs)
+        self.demo_mode = demo_mode
+        self._demo_tempdir = None
+        if self.demo_mode:
+            import tempfile
+
+            self._demo_tempdir = tempfile.TemporaryDirectory(prefix="mesh_pulse_demo_")
+            identity_directory = Path(self._demo_tempdir.name)
+
         self.event_log = EventLog()
         services = build_services(
             passphrase=passphrase,
@@ -642,15 +677,51 @@ class MeshPulseApp(App):
         self.broadcaster = services.broadcaster
         self.transfer = services.transfer
 
+    @staticmethod
+    def _is_connection_failure(transfer: TransferInfo) -> bool:
+        """Determine whether a transfer failure was caused by network/connection issues."""
+        if not transfer.error:
+            return True
+        err = transfer.error.lower()
+        non_connection_markers = (
+            "rejected",
+            "cancelled",
+            "canceled",
+            "checksum",
+            "sha256",
+            "hash mismatch",
+            "invalid tag",
+            "decryption failed",
+            "authentication",
+            "permission",
+            "disk full",
+            "file not found",
+            "protocol",
+        )
+        if any(marker in err for marker in non_connection_markers):
+            return False
+        return True
+
     def _on_transfer_event(self, event: TransferEvent) -> None:
         """Translate core events into Textual-thread-safe application updates."""
         if isinstance(event, IncomingTransferOffered):
             self._on_incoming_request(event.request)
-        elif isinstance(event, (TransferCompleted, TransferFailed)):
+        elif isinstance(event, TransferCompleted):
             transfer = event.transfer
             self.peer_manager.record_transfer_result(
                 transfer.peer_device_id or transfer.peer_ip,
-                success=isinstance(event, TransferCompleted),
+                success=True,
+            )
+        elif isinstance(event, TransferFailed):
+            transfer = event.transfer
+            # User-level actions (rejections, cancellations) do NOT count as network failures
+            if transfer.status in {TransferStatus.REJECTED, TransferStatus.CANCELLED}:
+                return
+            is_connection_failure = self._is_connection_failure(transfer)
+            self.peer_manager.record_transfer_result(
+                transfer.peer_device_id or transfer.peer_ip,
+                success=False,
+                connection_failure=is_connection_failure,
             )
 
     def _on_incoming_request(self, request) -> None:
@@ -701,18 +772,23 @@ class MeshPulseApp(App):
             log.debug("Unable to post transfer notification: %s", error)
 
     def on_mount(self) -> None:
-        """Start all background subsystems when the app mounts."""
+        """Start background subsystems or seed isolated demo state."""
         self.event_log.log("Mesh-Pulse starting up…", "info")
         self.monitor.start()
         self.event_log.log("System monitor active", "success")
-        self.broadcaster.start()
-        self.event_log.log(
-            f"P2P discovery broadcasting on port {BROADCAST_PORT}", "success"
-        )
-        self.transfer.start_server()
-        self.event_log.log(
-            f"Transfer server listening on port {TRANSFER_PORT}", "success"
-        )
+
+        if self.demo_mode:
+            self._setup_demo_data()
+        else:
+            self.broadcaster.start()
+            self.event_log.log(
+                f"P2P discovery broadcasting on port {BROADCAST_PORT}", "success"
+            )
+            self.transfer.start_server()
+            self.event_log.log(
+                f"Transfer server listening on port {TRANSFER_PORT}", "success"
+            )
+
         self.push_screen(
             DashboardScreen(
                 peer_manager=self.peer_manager,
@@ -724,6 +800,135 @@ class MeshPulseApp(App):
         )
         self.event_log.log("Dashboard ready", "success")
         log.info("Dashboard ready")
+
+    def _setup_demo_data(self) -> None:
+        """Seed deterministic local showcase state without any network traffic."""
+        import time
+
+        from mesh_pulse.core.discovery import Peer, PeerStatus
+        from mesh_pulse.core.inbox import IncomingFile, IncomingTransferRequest
+        from mesh_pulse.core.trust import TrustStatus
+
+        now = time.time()
+        mono = time.monotonic()
+
+        p1 = Peer(
+            hostname="laptop-dev",
+            ip="192.168.1.105",
+            port=5000,
+            status=PeerStatus.ONLINE,
+            trust_status=TrustStatus.TRUSTED,
+            device_id="mp-a1b2c3d4e5f60001",
+            fingerprint="A1B2:C3D4:E5F6:7890:1234:5678:9ABC:DEF0",
+            latency_ms=4.2,
+            successful_transfers=5,
+            failed_transfers=0,
+            last_seen_monotonic=mono,
+            last_transfer_at=now - 300,
+            protocol_version=3,
+        )
+        p2 = Peer(
+            hostname="workstation-alpha",
+            ip="192.168.1.42",
+            port=5000,
+            status=PeerStatus.ONLINE,
+            trust_status=TrustStatus.UNTRUSTED,
+            device_id="mp-b2c3d4e5f6a10002",
+            fingerprint="B2C3:D4E5:F6A1:0123:4567:89AB:CDEF:0123",
+            latency_ms=18.5,
+            successful_transfers=1,
+            failed_transfers=0,
+            last_seen_monotonic=mono,
+            last_transfer_at=now - 1200,
+            protocol_version=3,
+        )
+        p3 = Peer(
+            hostname="backup-server",
+            ip="192.168.1.200",
+            port=5000,
+            status=PeerStatus.STALE,
+            trust_status=TrustStatus.TRUSTED,
+            device_id="mp-c3d4e5f6a1b20003",
+            fingerprint="C3D4:E5F6:A1B2:3456:789A:BCDE:F012:3456",
+            latency_ms=112.0,
+            successful_transfers=12,
+            failed_transfers=1,
+            last_seen_monotonic=mono - 10,
+            last_transfer_at=now - 86400,
+            protocol_version=3,
+        )
+        p4 = Peer(
+            hostname="old-thinkpad",
+            ip="192.168.1.88",
+            port=5000,
+            status=PeerStatus.OFFLINE,
+            trust_status=TrustStatus.UNTRUSTED,
+            device_id="mp-d4e5f6a1b2c30004",
+            fingerprint="D4E5:F6A1:B2C3:4567:89AB:CDEF:0123:4567",
+            latency_ms=None,
+            successful_transfers=0,
+            failed_transfers=2,
+            last_seen_monotonic=mono - 60,
+            last_transfer_at=None,
+            protocol_version=2,
+        )
+
+        for peer in (p1, p2, p3, p4):
+            self.peer_manager.add_demo_peer(peer)
+
+        if self.history_store:
+            try:
+                self.history_store.record_transfer(
+                    transfer_id="demo-transfer-001",
+                    peer_ip="192.168.1.105",
+                    peer_device_id="mp-a1b2c3d4e5f60001",
+                    peer_name="laptop-dev",
+                    direction="send",
+                    status="complete",
+                    files=[
+                        {
+                            "filename": "dataset-q3.tar.gz",
+                            "filesize": 14_250_000,
+                            "status": "complete",
+                            "bytes_transferred": 14_250_000,
+                            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                        },
+                        {
+                            "filename": "analysis_notes.md",
+                            "filesize": 4200,
+                            "status": "complete",
+                            "bytes_transferred": 4200,
+                            "sha256": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+                        },
+                    ],
+                    error=None,
+                )
+            except Exception as e:
+                log.debug("Demo history recording ignored: %s", e)
+
+        if self.transfer and hasattr(self.transfer, "incoming"):
+            req = IncomingTransferRequest(
+                transfer_id="demo-incoming-001",
+                peer_device_id="mp-a1b2c3d4e5f60001",
+                peer_name="laptop-dev",
+                peer_ip="192.168.1.105",
+                files=(
+                    IncomingFile(
+                        name="shared-assets.zip",
+                        size=8_500_000,
+                        sha256="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                        file_id="demo-file-1",
+                    ),
+                ),
+                message="Review release assets",
+                total_size=8_500_000,
+            )
+            self.transfer.incoming.register(req)
+
+        self.event_log.log(
+            "Demo mode active: isolated in-memory workspace (no LAN traffic)",
+            "info",
+        )
 
     # ── Actions ────────────────────────────────────────────────────
 
@@ -927,6 +1132,12 @@ class MeshPulseApp(App):
 
     def on_unmount(self) -> None:
         log.info("Mesh-Pulse shutting down…")
-        self.transfer.stop_server()
-        self.broadcaster.stop()
+        if not self.demo_mode:
+            self.transfer.stop_server()
+            self.broadcaster.stop()
         self.monitor.stop()
+        if self._demo_tempdir is not None:
+            try:
+                self._demo_tempdir.cleanup()
+            except Exception as e:
+                log.debug("Demo tempdir cleanup: %s", e)
