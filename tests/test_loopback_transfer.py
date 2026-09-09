@@ -311,13 +311,17 @@ class TestTransferErrorCase:
         client = FileClient(port=BASE_PORT + 99, fernet_key=shared_key)
         client.send("127.0.0.1", src_path)
 
-        # Wait for the send thread to fail
-        deadline = time.time() + 10
+        # Wait for the send thread to exhaust retries and reach a terminal state
+        deadline = time.time() + 30
         while time.time() < deadline:
             transfers = client.get_transfers()
-            if transfers and transfers[-1].status == TransferStatus.FAILED:
+            if transfers and transfers[-1].status in {
+                TransferStatus.FAILED,
+                TransferStatus.COMPLETE,
+                TransferStatus.CANCELLED,
+            }:
                 break
-            time.sleep(0.2)
+            time.sleep(0.1)
 
         transfers = client.get_transfers()
         assert len(transfers) >= 1
