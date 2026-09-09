@@ -1,236 +1,260 @@
 # Mesh-Pulse
 
-[![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
+[![Python](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13-blue)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
-[![PyPI](https://img.shields.io/badge/pypi-not%20yet%20published-lightgrey)](#)
+[![CI](https://github.com/radikonreturn/mesh_pulse/actions/workflows/python-app.yml/badge.svg)](https://github.com/radikonreturn/mesh_pulse/actions/workflows/python-app.yml)
 
-**A terminal dashboard for your LAN: see every peer on your network, watch live system health, and send encrypted files — all without a GUI, an account, or a cloud server.**
+Mesh-Pulse is a terminal-first local network workspace for discovering trusted peers, monitoring their availability, and transferring files securely without cloud accounts, third-party infrastructure, or external servers.
 
-<!--
-DEMO GIF GOES HERE — this is the single highest-impact thing you can add.
-Record a 10-15s clip with asciinema (https://asciinema.org/) or terminalizer
-showing: app opens -> peer appears -> file sent -> received.
-Convert asciinema to gif with agg, then:
-![demo](docs/demo.gif)
--->
+It pairs cryptographic peer identity with an interactive Textual interface, giving developers and system administrators full LAN visibility and direct encrypted transfers from the console.
 
 ---
 
-## Why Mesh-Pulse?
+## Key Features
 
-| | Mesh-Pulse | Syncthing | scp / rsync | LocalSend |
-|---|---|---|---|---|
-| Setup | zero-config, just run it | config + web UI | manual host/key setup | GUI app install |
-| Interface | terminal (TUI) | web browser | terminal (no UI) | GUI |
-| Peer discovery | automatic (UDP broadcast) | automatic | manual (you type the IP) | automatic |
-| Live system stats | ✅ built in | ❌ | ❌ | ❌ |
-| Encryption | AES-256-GCM | TLS | SSH | TLS |
-| Best for | quick ad-hoc transfers + LAN visibility from the terminal | continuous folder sync | scripted/automated transfers | non-technical GUI users |
+- **Signed Peer Discovery**: Automatic local network discovery via UDP broadcast beacons signed with persistent Ed25519 device keys and protected against replay attacks.
+- **Trusted Device Pairing**: Public keys derived directly into stable device IDs; compare human-readable fingerprints to pair devices explicitly.
+- **Authenticated Sessions (Protocol v3)**: Mutual ephemeral X25519 key exchange signed by device identities, deriving transcript-bound session keys via HKDF-SHA256.
+- **Encrypted Streaming**: Files stream over TCP using AES-256-GCM chunk framing with unique per-chunk nonces.
+- **Interactive Transfer Approval**: Receivers review incoming transfer offers (files, sizes, sender identity) in a dedicated inbox modal before any data is written.
+- **Resumable Transfers**: Interrupted transfers automatically resume from verified byte offsets without re-transmitting existing chunks.
+- **Cryptographic Integrity & Atomic Commit**: Completed transfers are verified against an end-to-end SHA-256 hash before atomic commit into the receive directory, preventing file corruption or silent overwrites.
+- **Transfer History**: Persistent local SQLite database records all transfer events, throughput, file counts, and statuses with per-peer filtering.
+- **Network Intelligence**: Bounded peer observations track availability states (`ONLINE`, `STALE`, `OFFLINE`), measured TCP round-trip latencies, and explainable health metrics.
+- **Offline Demo Mode**: Isolated showcase workspace (`mesh-pulse --demo`) using temporary in-memory state without broadcasting on the local network.
+- **Legacy Compatibility**: Optional, explicit legacy mode (`--key`) supporting passphrase-derived symmetric transfers with protocol-v2 peers.
 
-If you live in a terminal and want to glance at your network and fire off a file without opening a browser or remembering an IP, that's the gap Mesh-Pulse fills.
+---
 
-## Features
+## Architecture
 
-- Local peer discovery with UDP broadcast heartbeats.
-- Live CPU, memory, disk, network, and latency views.
-- Secure file transfer over TCP with encrypted chunk framing.
-- Multi-file send support through a single transfer session.
-- Transfer progress, history, retry handling, and file integrity checks.
-- Textual-based dashboard with peer details, event logs, settings, and a file picker.
-- Keyboard-selectable peer workspace with peer-filtered transfer history.
-- Persistent Ed25519 device identity, fingerprint pairing, and explicit trust states.
-- Persistent configuration through `~/.mesh_pulse_config.json`.
+Mesh-Pulse separates presentation, orchestration, core domain logic, and cryptographic protocol framing:
 
-## Requirements
+```mermaid
+graph TD
+    TUI["Textual Terminal UI<br/>(Dashboard · Peer Workspace · Inbox · History · Settings)"]
+    APP["Application Composition & Services<br/>(build_services · Event Log · Thread-Safe Signals)"]
+    CORE["Core Managers<br/>(PeerManager · SecureTransfer · HistoryStore · TrustStore · Monitor)"]
+    LOWER["Protocols & Foundations<br/>(Signed UDP Discovery · Protocol-v3 TCP · AES-256-GCM · SQLite · Filesystem)"]
 
-- Python 3.10 or newer
-- A terminal that supports Textual applications
-- Network access between peers on the configured discovery and transfer ports
+    TUI --> APP
+    APP --> CORE
+    CORE --> LOWER
+```
 
-Runtime dependencies are listed in `requirements.txt` and `pyproject.toml`.
+---
 
-## Install
+## Transfer Protocol Flow
 
-For local development:
+Standard Protocol-v3 transfer lifecycle:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Sender as Sender
+    participant SC as Sender Client
+    participant RS as Receiver Server
+    actor Receiver as Receiver
+
+    Note over SC,RS: Signed Discovery & Pairing Verification
+    SC->>RS: TCP Connect
+    SC->>RS: Ephemeral X25519 Key + Ed25519 Identity Signature
+    RS->>SC: Ephemeral X25519 Key + Ed25519 Identity Signature
+    Note over SC,RS: Authenticated Handshake (HKDF-SHA256 -> AES-256-GCM Session Key)
+    SC->>RS: Encrypted Transfer Offer (files, sizes, SHA-256 hashes, transfer_id)
+    RS->>Receiver: Incoming Transfer Notification & Approval Prompt
+    Receiver-->>RS: User Approves Transfer
+    RS->>SC: Approval Response + Validated Resume Offsets
+    loop Encrypted Chunks (64 KB)
+        SC->>RS: Encrypted Data Frame (AES-256-GCM + Nonce)
+    end
+    Note over RS: Verify complete file SHA-256 against authenticated offer
+    Note over RS: Atomic commit partial file to final filename
+    RS->>SC: Transfer Complete Finish Frame
+    Note over SC,RS: Commit Record to Persistent SQLite History
+```
+
+---
+
+## Installation
+
+Mesh-Pulse requires Python 3.10, 3.11, 3.12, or 3.13.
+
+### Option 1: Install via pip
 
 ```bash
+pip install mesh-pulse
+```
+
+### Option 2: Install via pipx (Recommended for CLI use)
+
+```bash
+pipx install mesh-pulse
+```
+
+Or from a local clone:
+
+```bash
+pipx install .
+```
+
+### Option 3: Standalone Executable
+
+Pre-compiled standalone binaries that do not require an existing Python installation are available from the GitHub Releases page:
+- **Windows (x64)**: `mesh-pulse-windows-x64.zip` (extract and run `mesh-pulse.exe`)
+- **Linux (x64)**: `mesh-pulse-linux-x64.tar.gz` (extract and run `mesh-pulse`)
+
+### Option 4: Local Development Clone
+
+```bash
+git clone https://github.com/radikonreturn/mesh_pulse.git
+cd mesh_pulse
 python -m venv .venv
-source .venv/bin/activate
+source .venv/bin/activate   # On Windows PowerShell: .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 pip install -e .
 ```
 
-On Windows PowerShell:
+---
 
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-pip install -e .
-```
+## Quick Start
 
-The package also includes npm wrapper metadata. If installed through npm, the `mesh-pulse` command delegates to the Python application.
+### 1. Launch Mesh-Pulse
 
-## Run
-
-From the source tree:
-
-```bash
-python -m mesh_pulse
-```
-
-After editable installation:
+Run the command in your terminal:
 
 ```bash
 mesh-pulse
 ```
 
-Override ports when needed:
+Or execute directly through Python:
 
 ```bash
-mesh-pulse --broadcast-port 37020 --transfer-port 5000
+python -m mesh_pulse
 ```
 
-For deliberate legacy v2 interoperability, set a shared passphrase from the command line:
+### 2. Try Showcase / Demo Mode
+
+To explore the user interface without broadcasting across your local network:
 
 ```bash
-mesh-pulse --key "shared-passphrase"
+mesh-pulse --demo
 ```
 
-Normal launches use authenticated protocol v3 and do not use the built-in default
-passphrase. Devices must be explicitly trusted by fingerprint before v3 transfers
-are accepted. The `--key` option enables the compatibility-only v2 path.
+Demo mode uses an ephemeral temporary directory, loads realistic mock peers across different availability states, and simulates pending and historical transfers.
 
-## Configuration
-
-Configuration priority is:
-
-1. CLI options
-2. Environment variables
-3. `~/.mesh_pulse_config.json`
-4. Built-in defaults
-
-Supported environment variables:
-
-| Variable | Default | Purpose |
-|---|---|---|
-| `MESH_PULSE_KEY` | `mesh-pulse-default-key` | Shared transfer passphrase |
-| `MESH_PULSE_BCAST_PORT` | `37020` | UDP discovery port |
-| `MESH_PULSE_XFER_PORT` | `5000` | TCP transfer port |
-| `MESH_PULSE_RECEIVE_DIR` | `~/mesh_pulse_received` | Directory for incoming files |
-
-Example config file:
-
-```json
-{
-  "broadcast_port": 37020,
-  "transfer_port": 5000,
-  "receive_dir": "~/mesh_pulse_received",
-  "default_key": "legacy-only-passphrase"
-}
-```
-
-The settings screen in the TUI can save these values. Restart the application after changing ports or the receive directory.
-
-## File Transfer
-
-Mesh-Pulse starts a transfer server when the dashboard opens. To send files, choose a peer, open the send dialog, select one or more files or folders, and start the transfer.
-
-The transfer layer:
-
-- authenticates trusted Ed25519 identities and signs fresh X25519 session keys;
-- derives a fresh 32-byte session key with HKDF-SHA256 for every connection;
-- encrypts headers and file chunks with AES-256-GCM;
-- frames encrypted payloads with length prefixes;
-- verifies received file hashes;
-- records send and receive progress;
-- retries failed sends with backoff.
-
-Incoming files are written to the configured receive directory.
+---
 
 ## Keyboard Shortcuts
 
-| Key | Action |
-|---|---|
-| `S` | Open the send-file dialog |
-| `Enter` | Open the selected peer workspace |
-| `P` | Open the selected peer workspace |
-| `O` | Open the received-files directory |
-| `G` | Open settings |
-| `R` | Refresh the dashboard |
-| `C` | Clear the event log |
-| `D` | Toggle dark/light theme |
-| `Q` | Quit |
+| Shortcut | Action | Description |
+| :--- | :--- | :--- |
+| `S` | **Send File** | Open file picker to transmit files or directories to a peer |
+| `Enter` / `P` | **Peer Detail** | Inspect selected peer metrics, trust state, latency, and transfer stats |
+| `I` | **Inbox** | Review, accept, or reject incoming authenticated transfer offers |
+| `H` | **History** | Browse persistent SQLite transfer history across all sessions |
+| `G` | **Settings** | View local Ed25519 identity, fingerprint, and configured paths |
+| `O` | **Open Received** | Open the local incoming files directory in the system file manager |
+| `C` | **Cancel Transfer** | Cancel the most recent active outgoing transfer |
+| `R` | **Refresh** | Request immediate UI refresh and telemetry update |
+| `D` | **Toggle Theme** | Switch between dark and light color palettes |
+| `Q` | **Quit** | Gracefully disconnect active workers and exit |
 
-## Project Layout
+---
 
+## Configuration
+
+Mesh-Pulse resolves configuration in the following order of precedence:
+1. Command-line flags
+2. Environment variables
+3. User configuration file (`~/.mesh_pulse_config.json`)
+4. Built-in defaults
+
+### Command-Line Options
+
+```text
+Usage: mesh-pulse [OPTIONS]
+
+Options:
+  --broadcast-port INTEGER  UDP discovery port (default: 37020)
+  --transfer-port INTEGER   TCP transfer port (default: 5000)
+  --demo                    Run an isolated showcase workspace without network traffic
+  --key TEXT                Enable explicit legacy v2 transfers with a shared passphrase
+  --version                 Show the version and exit
+  --help                    Show this message and exit
 ```
-mesh_pulse/
-|-- app.py                  # Textual application and high-level UI actions
-|-- __main__.py             # click CLI entry point
-|-- core/
-|   |-- discovery.py        # UDP broadcast discovery and peer state
-|   |-- engine.py           # core subsystem startup helpers
-|   |-- monitor.py          # psutil-based system metrics
-|   |-- transfer.py         # encrypted TCP file transfer
-|   |-- identity.py         # persistent Ed25519 device identity
-|   |-- trust.py            # atomic trusted-device store
-|   `-- session.py          # authenticated protocol-v3 handshake
-|-- tui/
-|   |-- dashboard.py        # main dashboard screen
-|   |-- screens/            # settings and secondary screens
-|   |-- styles/             # Textual CSS
-|   `-- widgets/            # peer, health, transfer, and log widgets
-`-- utils/
-    |-- config.py           # defaults, environment, and user config
-    |-- crypto.py           # encryption and socket framing helpers
-    `-- logger.py           # Rich logging setup
-```
 
-Tests live in `tests/`.
+### Environment Variables
 
-## Development
+| Variable | Default | Purpose |
+| :--- | :--- | :--- |
+| `MESH_PULSE_BCAST_PORT` | `37020` | UDP port for discovery beacons |
+| `MESH_PULSE_XFER_PORT` | `5000` | TCP port for authenticated file transfers |
+| `MESH_PULSE_RECEIVE_DIR` | `~/mesh_pulse_received` | Target folder for accepted inbound files |
+| `MESH_PULSE_KEY` | *(None)* | Shared passphrase for legacy v2 interoperability |
 
-Install dependencies and the package in editable mode:
+---
+
+## Security Model
+
+Mesh-Pulse assumes the local host filesystem and user account are trusted, while treating all network packets, protocol frames, and remote peers as untrusted.
+
+- **Identity**: Each device generates an Ed25519 keypair on first run. Device IDs are deterministically derived from public keys (`device_id_from_public_key`).
+- **Pairing**: Trust is an explicit local decision. An operator compares public-key fingerprints before approving a peer.
+- **Fresh Session Keys**: For every transfer connection, both peers generate ephemeral X25519 keypairs, sign them with their Ed25519 identities, and compute a shared secret expanded with HKDF-SHA256 into a 256-bit AES-GCM session key.
+- **Defense in Depth**: Filenames are strictly sanitized to prevent path traversal; reserved device names (e.g., `CON`, `NUL`, `COM1`), control characters, and path separators are rejected.
+- **Integrity**: Files stream into hidden partial files (`.<transfer_id>_<file_id>.part`) and are committed atomically only after full SHA-256 verification. Existing files are never silently overwritten without collision avoidance.
+
+For an exhaustive technical specification of cryptographic bounds, replay protections, and threat assumptions, see [docs/security.md](docs/security.md).
+
+---
+
+## UI Screenshots
+
+Screenshots of Mesh-Pulse running in a terminal:
+
+| Dashboard View | Peer Detail Workspace |
+| :---: | :---: |
+| *Main dashboard monitoring local peers and transfers* | *Detailed peer metrics, trust status, and transfer statistics* |
+
+| Incoming Transfer Inbox | Persistent History |
+| :---: | :---: |
+| *Interactive approval prompt for incoming files* | *Searchable SQLite history of completed and interrupted transfers* |
+
+*(Reference images and visual assets are located in [`docs/images/`](docs/images/).)*
+
+---
+
+## Development & Testing
+
+Run tests and style linters:
 
 ```bash
-pip install -r requirements.txt
-pip install -e .
-```
+# Execute pytest suite
+pytest -q
 
-Run the test suite:
-
-```bash
-pytest
-```
-
-Run lint and format checks:
-
-```bash
+# Run Ruff linter and formatting checks
 ruff check .
 ruff format --check .
+
+# Build distribution packages
+python -m build
+
+# Build standalone executables
+python scripts/build_standalone.py
 ```
 
-Run all configured pre-commit hooks:
+See [CONTRIBUTING.md](CONTRIBUTING.md) for detailed guidelines.
 
-```bash
-pre-commit run --all-files
-```
+---
 
-Some tests create localhost sockets. If your environment blocks socket creation, run the tests in a shell or sandbox that allows loopback TCP/UDP access.
+## Known Limitations
 
-## Security Notes
+- **Local Area Networks**: Discovery relies on UDP broadcast packets and requires peers to be connected to the same Layer 2 / Layer 3 broadcast domain. Internet routing, NAT traversal, and cloud relaying are explicitly out of scope.
+- **Bandwidth**: Encryption and checksum verification throughput depend on host CPU capabilities.
 
-- Use a strong shared passphrase with `--key` or `MESH_PULSE_KEY`.
-- Keep discovery and transfer ports limited to trusted local networks.
-- Do not commit generated keys, logs, or received files.
-- Received file paths are handled defensively so incoming filenames cannot intentionally write outside the receive directory.
-- Transfer integrity is checked with SHA-256 hashes.
-
-## Contributing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md).
+---
 
 ## License
 
-Mesh-Pulse is released under the MIT License. See [LICENSE](LICENSE).
+Mesh-Pulse is released under the [MIT License](LICENSE).

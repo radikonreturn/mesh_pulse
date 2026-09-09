@@ -1,58 +1,58 @@
 # Contributing to Mesh-Pulse
 
-First off, thanks for taking the time to contribute! ❤️
+Thank you for contributing to Mesh-Pulse!
 
-The following is a set of guidelines for contributing to Mesh-Pulse. These are mostly guidelines, not rules. Use your best judgment, and feel free to propose changes to this document in a pull request.
-
-## How Can I Contribute?
-
-### Reporting Bugs
-
-Bugs are tracked as GitHub issues. When creating an issue, please include:
-- A clear, descriptive title.
-- Steps to reproduce the bug.
-- The behavior you expected.
-- Screenshots if applicable.
-- Your OS and Python version.
-
-### Suggesting Enhancements
-
-Enhancement suggestions are also tracked as GitHub issues. Please provide:
-- A clear, descriptive title.
-- A step-by-step description of the suggested enhancement.
-- An explanation of why this enhancement would be useful.
-
-### Pull Requests
-
-1. Fork the repo and create your branch from `main`.
-2. If you've added code that should be tested, add tests.
-3. If you've changed APIs, update the documentation.
-4. Ensure the test suite passes (`pytest`).
-5. Make sure your code lints.
+---
 
 ## Development Setup
 
-1. Clone the repository.
-2. Create a virtual environment: `python -m venv venv`.
-3. Activate the virtual environment:
-   - Linux/macOS: `source venv/bin/activate`
-   - Windows: `venv\Scripts\activate`
-4. Install dependencies: `pip install -r requirements.txt`.
-5. Install the package in editable mode: `pip install -e .`.
-6. Run tests: `pytest`.
+1. **Prerequisites**: Python 3.10, 3.11, 3.12, or 3.13.
+2. **Clone & Virtual Environment**:
+   ```bash
+   git clone https://github.com/radikonreturn/mesh_pulse.git
+   cd mesh_pulse
+   python -m venv .venv
+   source .venv/bin/activate  # On Windows: .\.venv\Scripts\Activate.ps1
+   ```
+3. **Install Dependencies**:
+   ```bash
+   pip install --upgrade pip
+   pip install -r requirements.txt
+   pip install -e .
+   pip install pytest ruff build wheel pyinstaller
+   ```
 
-## Styleguides
+---
 
-### Python Styleguide
+## Code Quality & Testing
 
-We follow [PEP 8](https://www.python.org/dev/peps/pep-0008/).
+Before submitting a pull request, ensure all checks pass:
 
-### Commit Messages
+```bash
+# Run test suite
+pytest -q
 
-- Use the present tense ("Add feature" not "Added feature").
-- Use the imperative mood ("Move cursor to..." not "Moves cursor to...").
-- Limit the first line to 72 characters or less.
+# Code formatting and linting
+ruff check .
+ruff format --check .
 
-## License
+# Auto-format code if needed
+ruff format .
+```
 
-By contributing, you agree that your contributions will be licensed under its MIT License.
+---
+
+## Code Style & Architecture Guidelines
+
+- **Standard Library & Typing**: Mesh-Pulse targets Python 3.10–3.13. Do not introduce Python 3.11+-only syntax without compatibility guards.
+- **Layer Separation**: Core modules (`mesh_pulse/core/`) must remain strictly decoupled from the Textual TUI (`mesh_pulse/tui/`).
+- **Cryptographic Security**: Do not weaken cryptographic primitives, nonce uniqueness, replay windows, or path sanitization. Any modifications to `identity.py`, `trust.py`, `session.py`, `transfer_protocol.py`, or `crypto.py` require thorough regression tests.
+
+---
+
+## Pull Request Expectations
+
+1. Keep PRs focused on a single change or fix.
+2. Include regression tests for bug fixes and new behavior.
+3. Update relevant documentation in `docs/` and `README.md` if user-facing behavior changes.
+4. Ensure the GitHub Actions CI test matrix (Python 3.10–3.13) passes completely.
