@@ -1,5 +1,7 @@
 import asyncio
+
 from mesh_pulse.app import MeshPulseApp
+
 
 async def main():
     app = MeshPulseApp()
@@ -10,5 +12,6 @@ async def main():
         print("Checking screen")
         print(app.screen.id or app.screen)
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     asyncio.run(main())

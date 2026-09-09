@@ -6,8 +6,6 @@ import json
 import os
 from unittest import mock
 
-
-
 # ── load_user_config / save_user_config ─────────────────────────────
 
 
@@ -18,6 +16,7 @@ def test_load_user_config_missing_file(tmp_path):
         tmp_path / "nonexistent.json",
     ):
         from mesh_pulse.utils.config import load_user_config
+
         result = load_user_config()
     assert result == {}
 
@@ -73,6 +72,7 @@ def test_env_broadcast_port_override():
     with mock.patch.dict(os.environ, {"MESH_PULSE_BCAST_PORT": "41000"}):
         # Re-evaluate _get() for broadcast_port
         from mesh_pulse.utils.config import _get
+
         val = _get("broadcast_port", "MESH_PULSE_BCAST_PORT", 37020)
     assert val == 41000
 
@@ -81,6 +81,7 @@ def test_env_transfer_port_override():
     """MESH_PULSE_XFER_PORT env var overrides the default transfer port."""
     with mock.patch.dict(os.environ, {"MESH_PULSE_XFER_PORT": "41001"}):
         from mesh_pulse.utils.config import _get
+
         val = _get("transfer_port", "MESH_PULSE_XFER_PORT", 5000)
     assert val == 41001
 
@@ -89,6 +90,7 @@ def test_env_key_override():
     """MESH_PULSE_KEY env var overrides the default encryption key."""
     with mock.patch.dict(os.environ, {"MESH_PULSE_KEY": "custom-secret"}):
         from mesh_pulse.utils.config import _get
+
         val = _get("default_key", "MESH_PULSE_KEY", "mesh-pulse-default-key")
     assert val == "custom-secret"
 
@@ -97,6 +99,7 @@ def test_env_receive_dir_override():
     """MESH_PULSE_RECEIVE_DIR env var overrides the default receive directory."""
     with mock.patch.dict(os.environ, {"MESH_PULSE_RECEIVE_DIR": "/tmp/custom_recv"}):
         from mesh_pulse.utils.config import _get
+
         val = _get("receive_dir", "MESH_PULSE_RECEIVE_DIR", "/default")
     assert val == "/tmp/custom_recv"
 

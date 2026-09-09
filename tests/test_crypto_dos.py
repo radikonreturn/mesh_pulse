@@ -1,6 +1,8 @@
 import struct
-import pytest
 from unittest.mock import MagicMock
+
+import pytest
+
 from mesh_pulse.utils.crypto import unpack_frame
 
 

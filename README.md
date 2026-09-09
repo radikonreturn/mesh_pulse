@@ -37,6 +37,8 @@ If you live in a terminal and want to glance at your network and fire off a file
 - Multi-file send support through a single transfer session.
 - Transfer progress, history, retry handling, and file integrity checks.
 - Textual-based dashboard with peer details, event logs, settings, and a file picker.
+- Keyboard-selectable peer workspace with peer-filtered transfer history.
+- Persistent Ed25519 device identity, fingerprint pairing, and explicit trust states.
 - Persistent configuration through `~/.mesh_pulse_config.json`.
 
 ## Requirements
@@ -89,13 +91,15 @@ Override ports when needed:
 mesh-pulse --broadcast-port 37020 --transfer-port 5000
 ```
 
-Set the transfer passphrase from the command line:
+For deliberate legacy v2 interoperability, set a shared passphrase from the command line:
 
 ```bash
 mesh-pulse --key "shared-passphrase"
 ```
 
-Every peer that should exchange files must use the same transfer passphrase.
+Normal launches use authenticated protocol v3 and do not use the built-in default
+passphrase. Devices must be explicitly trusted by fingerprint before v3 transfers
+are accepted. The `--key` option enables the compatibility-only v2 path.
 
 ## Configuration
 
@@ -122,7 +126,7 @@ Example config file:
   "broadcast_port": 37020,
   "transfer_port": 5000,
   "receive_dir": "~/mesh_pulse_received",
-  "default_key": "shared-passphrase"
+  "default_key": "legacy-only-passphrase"
 }
 ```
 
@@ -134,7 +138,8 @@ Mesh-Pulse starts a transfer server when the dashboard opens. To send files, cho
 
 The transfer layer:
 
-- derives a 32-byte AES key from the shared passphrase with PBKDF2-HMAC-SHA256;
+- authenticates trusted Ed25519 identities and signs fresh X25519 session keys;
+- derives a fresh 32-byte session key with HKDF-SHA256 for every connection;
 - encrypts headers and file chunks with AES-256-GCM;
 - frames encrypted payloads with length prefixes;
 - verifies received file hashes;
@@ -148,7 +153,8 @@ Incoming files are written to the configured receive directory.
 | Key | Action |
 |---|---|
 | `S` | Open the send-file dialog |
-| `P` | Show details for the most recent peer |
+| `Enter` | Open the selected peer workspace |
+| `P` | Open the selected peer workspace |
 | `O` | Open the received-files directory |
 | `G` | Open settings |
 | `R` | Refresh the dashboard |
@@ -166,7 +172,10 @@ mesh_pulse/
 |   |-- discovery.py        # UDP broadcast discovery and peer state
 |   |-- engine.py           # core subsystem startup helpers
 |   |-- monitor.py          # psutil-based system metrics
-|   `-- transfer.py         # encrypted TCP file transfer
+|   |-- transfer.py         # encrypted TCP file transfer
+|   |-- identity.py         # persistent Ed25519 device identity
+|   |-- trust.py            # atomic trusted-device store
+|   `-- session.py          # authenticated protocol-v3 handshake
 |-- tui/
 |   |-- dashboard.py        # main dashboard screen
 |   |-- screens/            # settings and secondary screens

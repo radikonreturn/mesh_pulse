@@ -5,8 +5,9 @@ Architecture:
     - FileClient: sends file batches to a peer
     - SecureTransfer: unified facade wrapping both (used by app.py / TUI)
 
-Protocol (v2):
-    Session open  → encrypted JSON control frame: {"type": "session", "version": 2, "count": N}
+Protocol (v3 trusted mode, v2 explicit legacy mode):
+    Session open  → authenticated handshake, then encrypted JSON control frame
+                     {"type": "session", "version": 3, "count": N}
     Per file      → encrypted JSON header:        {"type": "file", "name": "...", "size": N, "sha256": "..."}
                   → N encrypted data chunks (64 KB each)
     Session close → encrypted JSON frame:         {"type": "fin"}
@@ -15,8 +16,8 @@ All frames are length-prefixed (4-byte big-endian) and AES-256-GCM encrypted.
 
 Security:
     AES-256-GCM with a per-chunk random 12-byte nonce.
-    Key derived from shared passphrase via PBKDF2-HMAC-SHA256 (480 000 iterations,
-    fixed application salt) — both ends derive the same key without exchanging salt.
+    Trusted mode derives an independent key from Ed25519-authenticated ephemeral
+    X25519 keys. The compatibility-only v2 mode derives a PBKDF2 passphrase key.
 
 Retry:
     FileClient retries failed sends up to MAX_RETRIES times with exponential backoff.
@@ -30,14 +31,29 @@ import math
 import socket
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Callable
 
+from cryptography.exceptions import InvalidTag
+
+from mesh_pulse.core.identity import DeviceIdentity
+from mesh_pulse.core.session import (
+    PROTOCOL_VERSION,
+    AuthenticationError,
+    ProtocolError,
+    client_handshake,
+    server_handshake,
+)
+from mesh_pulse.core.trust import TrustedDevice, TrustStatus, TrustStore
 from mesh_pulse.utils.config import (
     CHUNK_SIZE,
+    HEADER_MAX_SIZE,
+    MAX_FILE_SIZE,
+    MAX_FILES_PER_SESSION,
     MAX_RETRIES,
+    MAX_SESSION_SIZE,
     RECEIVE_DIR,
     RETRY_DELAYS,
     TRANSFER_BACKLOG,
@@ -83,6 +99,7 @@ class TransferInfo:
     started_at: float = field(default_factory=time.time)
     error: str | None = None
     retry_count: int = 0
+    peer_device_id: str | None = None
 
     @property
     def progress(self) -> float:
@@ -112,6 +129,7 @@ class TransferInfo:
             "progress": round(self.progress, 1),
             "speed_mbps": round(self.speed_mbps, 2),
             "retry_count": self.retry_count,
+            "peer_device_id": self.peer_device_id,
         }
 
 
@@ -144,9 +162,15 @@ def _recv_frame_json(sock: socket.socket, key: bytes) -> dict:
     Returns:
         Parsed dict from the decrypted JSON frame.
     """
-    encrypted = unpack_frame(sock)
+    encrypted = unpack_frame(sock, max_size=HEADER_MAX_SIZE + 64)
     raw = decrypt_chunk(encrypted, key)
-    return json.loads(raw.decode("utf-8"))
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ProtocolError("Invalid transfer control frame") from error
+    if not isinstance(payload, dict):
+        raise ProtocolError("Transfer control frame must be an object")
+    return payload
 
 
 def _recv_frame_bytes(sock: socket.socket, key: bytes) -> bytes:
@@ -159,8 +183,56 @@ def _recv_frame_bytes(sock: socket.socket, key: bytes) -> bytes:
     Returns:
         Decrypted plaintext bytes.
     """
-    encrypted = unpack_frame(sock)
+    encrypted = unpack_frame(sock, max_size=CHUNK_SIZE + 64)
     return decrypt_chunk(encrypted, key)
+
+
+def _validate_session_header(
+    session: dict, expected_version: int
+) -> tuple[int, str | None]:
+    """Validate bounded session metadata before accepting any file frames."""
+    if session.get("type") != "session":
+        raise ProtocolError("Expected session frame")
+    if session.get("version") != expected_version:
+        raise ProtocolError("Protocol version mismatch")
+    count = session.get("count")
+    if (
+        isinstance(count, bool)
+        or not isinstance(count, int)
+        or not 1 <= count <= MAX_FILES_PER_SESSION
+    ):
+        raise ProtocolError("Invalid file count")
+    message = session.get("message")
+    if message is not None and (not isinstance(message, str) or len(message) > 4096):
+        raise ProtocolError("Invalid transfer message")
+    return count, message
+
+
+def _validate_file_header(header: dict) -> tuple[str, int, str]:
+    """Validate and sanitize remote file metadata."""
+    if header.get("type") != "file":
+        raise ProtocolError("Expected file frame")
+    raw_name = header.get("name")
+    if not isinstance(raw_name, str) or not raw_name or len(raw_name) > 255:
+        raise ProtocolError("Invalid filename")
+    filename = Path(raw_name).name
+    if filename in {"", ".", ".."}:
+        raise ProtocolError("Invalid filename")
+    filesize = header.get("size")
+    if (
+        isinstance(filesize, bool)
+        or not isinstance(filesize, int)
+        or not 0 <= filesize <= MAX_FILE_SIZE
+    ):
+        raise ProtocolError("Invalid file size")
+    expected_hash = header.get("sha256")
+    if (
+        not isinstance(expected_hash, str)
+        or len(expected_hash) != 64
+        or any(character not in "0123456789abcdef" for character in expected_hash)
+    ):
+        raise ProtocolError("Invalid SHA-256 digest")
+    return filename, filesize, expected_hash
 
 
 def _sha256_of_file(path: Path) -> str:
@@ -202,12 +274,26 @@ class FileServer(threading.Thread):
         on_file_received: Callable[[TransferInfo], None] | None = None,
         # Legacy compat: accept fernet_key but ignore (unused in v2)
         fernet_key: bytes | None = None,
+        identity: DeviceIdentity | None = None,
+        trust_store: TrustStore | None = None,
+        legacy_mode: bool | None = None,
     ):
         super().__init__(daemon=True, name="file-server")
         self._port = port
         self._receive_dir = Path(receive_dir)
         self._receive_dir.mkdir(parents=True, exist_ok=True)
-        self._key = derive_session_key(passphrase) if passphrase else derive_session_key("")
+        self._key = (
+            derive_session_key(passphrase) if passphrase else derive_session_key("")
+        )
+        self._identity = identity
+        self._trust_store = trust_store
+        self._legacy_mode = (
+            (identity is None or trust_store is None)
+            if legacy_mode is None
+            else legacy_mode
+        )
+        if not self._legacy_mode and (identity is None or trust_store is None):
+            raise ValueError("Trusted protocol mode requires identity and trust store")
         self._on_update = on_transfer_update
         self._on_file_received = on_file_received
         self._running = threading.Event()
@@ -241,7 +327,7 @@ class FileServer(threading.Thread):
                     name=f"recv-{addr[0]}",
                 )
                 handler.start()
-            except socket.timeout:
+            except TimeoutError:
                 continue
             except OSError:
                 if self._running.is_set():
@@ -268,49 +354,63 @@ class FileServer(threading.Thread):
     def _receive_session(self, conn: socket.socket, peer_ip: str) -> None:
         """Handle a single session connection from a peer."""
         try:
-            # ── Session header ──
-            session = _recv_frame_json(conn, self._key)
-            if session.get("type") != "session":
-                log.error("Expected session frame from %s, got: %s", peer_ip, session)
-                return
-
-            protocol_version = session.get("version", 1)
-            if protocol_version != 2:
-                log.error(
-                    "Unsupported protocol version %d from %s", protocol_version, peer_ip
+            if self._legacy_mode:
+                session_key = self._key
+                peer_device_id = None
+                expected_version = 2
+            else:
+                authenticated = server_handshake(
+                    conn,
+                    self._identity,
+                    self._trust_store,
                 )
-                return
+                session_key = authenticated.key
+                peer_device_id = authenticated.peer_device_id
+                expected_version = PROTOCOL_VERSION
 
-            count = session.get("count", 1)
-            message = session.get("message")
+            session = _recv_frame_json(conn, session_key)
+            count, message = _validate_session_header(session, expected_version)
             if message:
                 log.info("Message from %s: %s", peer_ip, message)
 
             # ── Receive each file ──
+            session_size = 0
             for _ in range(count):
-                ctrl = _recv_frame_json(conn, self._key)
+                ctrl = _recv_frame_json(conn, session_key)
                 if ctrl.get("type") == "fin":
                     break
-                if ctrl.get("type") != "file":
-                    log.error("Unexpected frame type from %s: %s", peer_ip, ctrl)
-                    break
-                self._receive_one_file(conn, peer_ip, ctrl)
+                _, filesize, _ = _validate_file_header(ctrl)
+                session_size += filesize
+                if session_size > MAX_SESSION_SIZE:
+                    raise ProtocolError("Transfer session exceeds size limit")
+                self._receive_one_file(
+                    conn,
+                    peer_ip,
+                    ctrl,
+                    session_key,
+                    peer_device_id,
+                )
 
-        except Exception as e:
+        except (AuthenticationError, ProtocolError, InvalidTag) as e:
+            log.warning("Rejected transfer session from %s: %s", peer_ip, e)
+        except (ConnectionError, OSError, ValueError) as e:
             log.error("Session error from %s: %s", peer_ip, e)
         finally:
             conn.close()
 
     def _receive_one_file(
-        self, conn: socket.socket, peer_ip: str, header: dict
+        self,
+        conn: socket.socket,
+        peer_ip: str,
+        header: dict,
+        session_key: bytes | None = None,
+        peer_device_id: str | None = None,
     ) -> None:
         """Receive a single file within an open session."""
         info: TransferInfo | None = None
         try:
-            # Sanitize filename to prevent path traversal
-            filename = Path(header["name"]).name
-            filesize: int = int(header["size"])
-            expected_hash: str = header["sha256"]
+            filename, filesize, expected_hash = _validate_file_header(header)
+            frame_key = session_key or self._key
 
             chunk_count = math.ceil(filesize / CHUNK_SIZE) if filesize > 0 else 0
 
@@ -320,6 +420,7 @@ class FileServer(threading.Thread):
                 direction=TransferDirection.RECV,
                 peer_ip=peer_ip,
                 status=TransferStatus.ACTIVE,
+                peer_device_id=peer_device_id,
             )
             self._register_transfer(info)
 
@@ -329,7 +430,10 @@ class FileServer(threading.Thread):
 
             with open(dest, "wb") as f:
                 for _ in range(chunk_count):
-                    plaintext = _recv_frame_bytes(conn, self._key)
+                    plaintext = _recv_frame_bytes(conn, frame_key)
+                    remaining = filesize - info.bytes_transferred
+                    if len(plaintext) > min(CHUNK_SIZE, remaining):
+                        raise ProtocolError("File chunk exceeds declared size")
                     f.write(plaintext)
                     hasher.update(plaintext)
                     info.bytes_transferred += len(plaintext)
@@ -353,7 +457,7 @@ class FileServer(threading.Thread):
                     info.speed_mbps,
                 )
 
-        except Exception as e:
+        except (ConnectionError, OSError, ProtocolError, InvalidTag, ValueError) as e:
             if info:
                 info.status = TransferStatus.FAILED
                 info.error = str(e)
@@ -364,8 +468,8 @@ class FileServer(threading.Thread):
             if info and self._on_file_received:
                 try:
                     self._on_file_received(info)
-                except Exception:
-                    pass
+                except (RuntimeError, TypeError, ValueError):
+                    log.exception("File-received callback failed")
 
     def _register_transfer(self, info: TransferInfo) -> None:
         with self._lock:
@@ -376,8 +480,8 @@ class FileServer(threading.Thread):
         if self._on_update:
             try:
                 self._on_update()
-            except Exception:
-                pass
+            except (RuntimeError, TypeError, ValueError):
+                log.exception("Transfer update callback failed")
 
 
 # ─── FileClient (TCP Sender) ──────────────────────────────────────
@@ -409,9 +513,25 @@ class FileClient:
         on_progress: Callable[[str, int, int], None] | None = None,
         # Legacy compat: accept fernet_key but ignore (unused in v2)
         fernet_key: bytes | None = None,
+        identity: DeviceIdentity | None = None,
+        trust_store: TrustStore | None = None,
+        peer_resolver: Callable[[str], object | None] | None = None,
+        legacy_mode: bool | None = None,
     ):
         self._port = port
-        self._key = derive_session_key(passphrase) if passphrase else derive_session_key("")
+        self._key = (
+            derive_session_key(passphrase) if passphrase else derive_session_key("")
+        )
+        self._identity = identity
+        self._trust_store = trust_store
+        self._peer_resolver = peer_resolver
+        self._legacy_mode = (
+            (identity is None or trust_store is None)
+            if legacy_mode is None
+            else legacy_mode
+        )
+        if not self._legacy_mode and (identity is None or trust_store is None):
+            raise ValueError("Trusted protocol mode requires identity and trust store")
         self._on_update = on_transfer_update
         self._on_progress = on_progress
         self._transfers: list[TransferInfo] = []
@@ -482,13 +602,22 @@ class FileClient:
         if not valid_paths:
             log.error("No valid files to send to %s", peer_ip)
             return
+        if len(valid_paths) > MAX_FILES_PER_SESSION:
+            log.error("Too many files in transfer to %s", peer_ip)
+            return
 
         # Pre-compute hashes so they're ready when we connect
         file_meta: list[tuple[Path, int, str]] = []
         for p in valid_paths:
             size = p.stat().st_size
+            if size > MAX_FILE_SIZE:
+                log.error("File exceeds configured transfer limit: %s", p.name)
+                return
             sha = _sha256_of_file(p)
             file_meta.append((p, size, sha))
+        if sum(size for _, size, _ in file_meta) > MAX_SESSION_SIZE:
+            log.error("Transfer batch exceeds configured session limit")
+            return
 
         # Create TransferInfo entries for each file
         infos: list[TransferInfo] = []
@@ -499,6 +628,7 @@ class FileClient:
                 direction=TransferDirection.SEND,
                 peer_ip=peer_ip,
                 status=TransferStatus.PENDING,
+                peer_device_id=self._peer_device_id(peer_ip),
             )
             self._register_transfer(info)
             infos.append(info)
@@ -523,6 +653,13 @@ class FileClient:
             try:
                 self._send_session(peer_ip, file_meta, infos, message)
                 # If we get here, all files sent successfully
+                return
+            except (AuthenticationError, ProtocolError) as e:
+                log.warning("Transfer authentication failed for %s: %s", peer_ip, e)
+                for info in infos:
+                    info.status = TransferStatus.FAILED
+                    info.error = "Transfer rejected."
+                self._notify()
                 return
             except (OSError, ConnectionError) as e:
                 log.warning("Batch send attempt %d failed: %s", attempt + 1, e)
@@ -554,15 +691,28 @@ class FileClient:
         try:
             sock.connect((peer_ip, self._port))
 
+            if self._legacy_mode:
+                session_key = self._key
+                protocol_version = 2
+            else:
+                trusted_peer = self._resolve_trusted_peer(peer_ip)
+                authenticated = client_handshake(
+                    sock,
+                    self._identity,
+                    trusted_peer,
+                )
+                session_key = authenticated.key
+                protocol_version = PROTOCOL_VERSION
+
             # ── Session header ──
             session_frame: dict = {
                 "type": "session",
-                "version": 2,
+                "version": protocol_version,
                 "count": len(file_meta),
             }
             if message:
                 session_frame["message"] = message
-            _send_frame(sock, self._key, session_frame)
+            _send_frame(sock, session_key, session_frame)
 
             # ── Send each file ──
             for (path, size, sha), info in zip(file_meta, infos):
@@ -575,7 +725,7 @@ class FileClient:
                 # File header
                 _send_frame(
                     sock,
-                    self._key,
+                    session_key,
                     {
                         "type": "file",
                         "name": path.name,
@@ -588,13 +738,15 @@ class FileClient:
                 with open(path, "rb") as f:
                     for _ in range(chunk_count):
                         raw = f.read(CHUNK_SIZE)
-                        _send_frame(sock, self._key, raw)
+                        _send_frame(sock, session_key, raw)
                         info.bytes_transferred += len(raw)
                         if self._on_progress:
                             try:
-                                self._on_progress(path.name, info.bytes_transferred, size)
-                            except Exception:
-                                pass
+                                self._on_progress(
+                                    path.name, info.bytes_transferred, size
+                                )
+                            except (RuntimeError, TypeError, ValueError):
+                                log.exception("Transfer progress callback failed")
                         self._notify()
 
                 info.status = TransferStatus.COMPLETE
@@ -604,10 +756,30 @@ class FileClient:
                 self._notify()
 
             # ── FIN ──
-            _send_frame(sock, self._key, {"type": "fin"})
+            _send_frame(sock, session_key, {"type": "fin"})
 
         finally:
             sock.close()
+
+    def _peer_device_id(self, peer_ip: str) -> str | None:
+        if self._peer_resolver is None:
+            return None
+        peer = self._peer_resolver(peer_ip)
+        return getattr(peer, "device_id", None) if peer is not None else None
+
+    def _resolve_trusted_peer(self, peer_ip: str) -> TrustedDevice:
+        if self._peer_resolver is None or self._trust_store is None:
+            raise AuthenticationError("Peer identity is unavailable")
+        peer = self._peer_resolver(peer_ip)
+        device_id = getattr(peer, "device_id", None)
+        public_key = getattr(peer, "public_key", None)
+        trust_status = getattr(peer, "trust_status", TrustStatus.NEW)
+        if not device_id or not public_key or trust_status != TrustStatus.TRUSTED:
+            raise AuthenticationError("Peer is not trusted")
+        record = self._trust_store.get(device_id)
+        if record is None or record.public_key != public_key:
+            raise AuthenticationError("Wrong peer identity")
+        return record
 
     def _register_transfer(self, info: TransferInfo) -> None:
         with self._lock:
@@ -618,8 +790,8 @@ class FileClient:
         if self._on_update:
             try:
                 self._on_update()
-            except Exception:
-                pass
+            except (RuntimeError, TypeError, ValueError):
+                log.exception("Transfer update callback failed")
 
 
 # ─── SecureTransfer (Unified facade for app.py / TUI) ─────────────
@@ -644,6 +816,10 @@ class SecureTransfer:
         on_transfer_update: Callable | None = None,
         on_file_received: Callable[[TransferInfo], None] | None = None,
         on_progress: Callable[[str, int, int], None] | None = None,
+        identity: DeviceIdentity | None = None,
+        trust_store: TrustStore | None = None,
+        peer_resolver: Callable[[str], object | None] | None = None,
+        legacy_mode: bool | None = None,
     ):
         self._port = transfer_port
         self._on_update = on_transfer_update
@@ -654,12 +830,19 @@ class SecureTransfer:
             passphrase=passphrase,
             on_transfer_update=on_transfer_update,
             on_file_received=on_file_received,
+            identity=identity,
+            trust_store=trust_store,
+            legacy_mode=legacy_mode,
         )
         self._client = FileClient(
             port=transfer_port,
             passphrase=passphrase,
             on_transfer_update=on_transfer_update,
             on_progress=on_progress,
+            identity=identity,
+            trust_store=trust_store,
+            peer_resolver=peer_resolver,
+            legacy_mode=legacy_mode,
         )
 
     def start_server(self) -> None:

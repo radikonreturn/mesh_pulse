@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import os
-import time
 import threading
+import time
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import ClassVar
 
 from rich.console import Group
 from rich.text import Text
@@ -43,7 +44,11 @@ class EventLog:
             self._events.append((now, level, message))
 
         # ── Mirror to panel_output.txt ──
-        timestamp = datetime.fromtimestamp(now).strftime("%H:%M:%S")
+        timestamp = (
+            datetime.fromtimestamp(now, tz=timezone.utc)
+            .astimezone()
+            .strftime("%H:%M:%S")
+        )
         line = f"[{timestamp}] {message}\n"
         try:
             with open(_LOG_FILE, "a", encoding="utf-8") as fh:
@@ -94,18 +99,18 @@ class EventLogWidget(Static):
     }
     """
 
-    LEVEL_STYLES = {
+    LEVEL_STYLES: ClassVar[dict[str, str]] = {
         "info": "dim white",
         "success": "bold green",
         "warning": "bold yellow",
         "error": "bold red",
     }
 
-    LEVEL_ICONS = {
-        "info": "│",
-        "success": "✓",
-        "warning": "⚠",
-        "error": "✗",
+    LEVEL_ICONS: ClassVar[dict[str, str]] = {
+        "info": "·",
+        "success": "+",
+        "warning": "!",
+        "error": "×",
     }
 
     def __init__(self, event_log: EventLog, **kwargs):
@@ -120,18 +125,19 @@ class EventLogWidget(Static):
         """Rebuild the event log display."""
         events = self._log.get_events(30)
 
-        header = Text("📋 EVENT LOG", style="bold cyan")
+        header = Text("EVENTS", style="bold")
 
         if not events:
             content = Group(
                 header,
                 Text(""),
-                Text("  Waiting for events...", style="dim italic"),
+                Text("  Waiting for activity…", style="dim italic"),
             )
             self.update(content)
             return
 
         from rich.console import RenderableType
+
         rows: list[RenderableType] = [header, Text("")]
 
         for ts, level, message in reversed(events):

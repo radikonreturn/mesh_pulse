@@ -29,7 +29,6 @@ from textual.widgets import Static
 
 from mesh_pulse.core.monitor import SystemMonitor
 
-
 # ── Sparkline helpers ────────────────────────────────────────────────
 SPARK_CHARS = "▁▂▃▄▅▆▇█"
 
@@ -94,6 +93,7 @@ def _get_cpu_temp() -> str | None:
         return None
     try:
         import psutil
+
         temps = psutil.sensors_temperatures()
         # Try common sensor names
         for key in ("coretemp", "cpu_thermal", "k10temp", "acpitz"):
@@ -101,8 +101,8 @@ def _get_cpu_temp() -> str | None:
             if entries:
                 avg = sum(e.current for e in entries) / len(entries)
                 return f"{avg:.0f}°C"
-    except Exception:
-        pass
+    except (OSError, ValueError):
+        return None
     return None
 
 
@@ -163,8 +163,9 @@ class SystemHealthWidget(Static):
 
         # ── Per-core CPU ──
         from rich.console import RenderableType
+
         rows: list[RenderableType] = [
-            Text("💻 SYSTEM HEALTH", style="bold cyan"),
+            Text("SYSTEM", style="bold"),
             Text(""),
             gauges,
             ram_detail,
@@ -172,7 +173,7 @@ class SystemHealthWidget(Static):
         ]
 
         if m.cpu_per_core:
-            core_line = Text("  ─── Cores ─── ", style="dim bright_cyan")
+            core_line = Text("  Cores", style="dim")
             # Build a compact row: "0:▅ 1:▂ 2:▇ …"
             core_parts: list[tuple[str, str]] = []
             for i, pct in enumerate(m.cpu_per_core):
@@ -185,20 +186,16 @@ class SystemHealthWidget(Static):
             rows.extend([core_line, cores_text, Text("")])
 
         # ── Sparklines ──
-        rows.append(Text("  ─── Trends (60s) ───", style="dim bright_cyan"))
-        rows.append(
-            Text.assemble(("  CPU ", "bold cyan"), ("(60s) ", "dim"))
-        )
+        rows.append(Text("  Trends · 60 seconds", style="dim"))
+        rows.append(Text.assemble(("  CPU ", "bold cyan"), ("(60s) ", "dim")))
         rows.append(Text("  ") + _sparkline(cpu_history))
         rows.append(Text(""))
-        rows.append(
-            Text.assemble(("  RAM ", "bold magenta"), ("(60s) ", "dim"))
-        )
+        rows.append(Text.assemble(("  RAM ", "bold magenta"), ("(60s) ", "dim")))
         rows.append(Text("  ") + _sparkline(ram_history))
         rows.append(Text(""))
 
         # ── Network throughput ──
-        rows.append(Text("  ─── Throughput ───", style="dim bright_cyan"))
+        rows.append(Text("  Throughput", style="dim"))
         rows.append(
             Text.assemble(
                 ("  NET  ", "bold bright_green"),

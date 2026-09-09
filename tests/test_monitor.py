@@ -9,7 +9,6 @@ import pytest
 from mesh_pulse.core.monitor import SystemMetrics, SystemMonitor, get_system_metrics
 from mesh_pulse.utils.config import METRIC_HISTORY_SIZE
 
-
 # ── get_system_metrics ───────────────────────────────────────────────
 
 

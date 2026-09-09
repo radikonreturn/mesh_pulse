@@ -10,8 +10,8 @@ from __future__ import annotations
 
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Callable
 
 import psutil
 
@@ -44,16 +44,16 @@ def get_system_metrics() -> dict:
         disk_io = psutil.disk_io_counters()
         disk_read = disk_io.read_bytes if disk_io else 0
         disk_write = disk_io.write_bytes if disk_io else 0
-    except Exception:
+    except OSError:
         disk_read = 0
         disk_write = 0
 
     try:
         disk_usage = psutil.disk_usage("/")
-    except Exception:
+    except OSError:
         try:
             disk_usage = psutil.disk_usage("C:\\")
-        except Exception:
+        except OSError:
             disk_usage = None
 
     return {
@@ -239,7 +239,7 @@ class SystemMonitor:
                 if self._on_update:
                     self._on_update(metrics)
 
-            except Exception as e:
+            except (OSError, RuntimeError, ValueError) as e:
                 log.debug("Monitor sample error: %s", e)
 
             time.sleep(self._interval)
@@ -273,17 +273,17 @@ class SystemMonitor:
                 metrics.disk_write_bytes = disk_io.write_bytes
                 metrics.disk_read_count = disk_io.read_count
                 metrics.disk_write_count = disk_io.write_count
-        except Exception:
+        except OSError:
             pass
 
         try:
             disk_usage = psutil.disk_usage("/")
             metrics.disk_usage_percent = disk_usage.percent
-        except Exception:
+        except OSError:
             try:
                 disk_usage = psutil.disk_usage("C:\\")
                 metrics.disk_usage_percent = disk_usage.percent
-            except Exception:
+            except OSError:
                 pass
 
         # Network I/O
@@ -294,7 +294,7 @@ class SystemMonitor:
                 metrics.net_recv_bytes = net_io.bytes_recv
                 metrics.net_sent_packets = net_io.packets_sent
                 metrics.net_recv_packets = net_io.packets_recv
-        except Exception:
+        except OSError:
             pass
 
         return metrics

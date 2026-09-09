@@ -21,12 +21,11 @@ import stat
 import struct
 
 from cryptography.fernet import Fernet
+from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-from cryptography.hazmat.primitives import hashes
 
-from mesh_pulse.utils.config import KEY_FILE, PBKDF2_ITERATIONS, NONCE_SIZE
-
+from mesh_pulse.utils.config import KEY_FILE, NONCE_SIZE, PBKDF2_ITERATIONS
 
 # ─── Application-level fixed salt ─────────────────────────────────
 # Using a fixed salt means both ends derive the same key from the same
@@ -182,7 +181,7 @@ def load_or_generate_key(path: str = KEY_FILE) -> bytes:
         try:
             Fernet(key)
             return key
-        except Exception:
+        except (TypeError, ValueError):
             pass  # regenerate if corrupted
 
     key = Fernet.generate_key()

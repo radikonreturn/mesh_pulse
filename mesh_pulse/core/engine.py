@@ -22,10 +22,13 @@ Or use the context manager:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
 from mesh_pulse.core.discovery import PeerDiscovery, PeerManager
+from mesh_pulse.core.identity import DeviceIdentity
 from mesh_pulse.core.monitor import SystemMonitor
 from mesh_pulse.core.transfer import FileClient, FileServer
+from mesh_pulse.core.trust import TrustStore
 from mesh_pulse.utils.config import BROADCAST_PORT, TRANSFER_PORT
 from mesh_pulse.utils.logger import get_logger
 
@@ -41,11 +44,14 @@ class EngineHandles:
     file_server: FileServer
     file_client: FileClient
     monitor: SystemMonitor
+    identity: DeviceIdentity
+    trust_store: TrustStore
 
 
 def start_engine(
     broadcast_port: int = BROADCAST_PORT,
     transfer_port: int = TRANSFER_PORT,
+    identity_directory: str | Path | None = None,
 ) -> EngineHandles:
     """Start all Mesh-Pulse subsystems without blocking the main thread.
 
@@ -63,7 +69,9 @@ def start_engine(
     Returns:
         EngineHandles with references to all running subsystems.
     """
-    peer_manager = PeerManager()
+    identity = DeviceIdentity.load_or_create(identity_directory)
+    trust_store = TrustStore(identity.directory / "trusted_devices.json")
+    peer_manager = PeerManager(trust_store=trust_store)
     monitor = SystemMonitor()
 
     discovery = PeerDiscovery(
@@ -71,10 +79,22 @@ def start_engine(
         transfer_port=transfer_port,
         local_metrics_fn=lambda: monitor.latest.to_broadcast_dict(),
         peer_manager=peer_manager,
+        identity=identity,
     )
 
-    file_server = FileServer(port=transfer_port)
-    file_client = FileClient(port=transfer_port)
+    file_server = FileServer(
+        port=transfer_port,
+        identity=identity,
+        trust_store=trust_store,
+        legacy_mode=False,
+    )
+    file_client = FileClient(
+        port=transfer_port,
+        identity=identity,
+        trust_store=trust_store,
+        peer_resolver=peer_manager.get_peer,
+        legacy_mode=False,
+    )
 
     # Start all threads (all are daemon=True, non-blocking)
     monitor.start()
@@ -94,6 +114,8 @@ def start_engine(
         file_server=file_server,
         file_client=file_client,
         monitor=monitor,
+        identity=identity,
+        trust_store=trust_store,
     )
 
 
@@ -122,13 +144,19 @@ class MeshEngine:
         self,
         broadcast_port: int = BROADCAST_PORT,
         transfer_port: int = TRANSFER_PORT,
+        identity_directory: str | Path | None = None,
     ):
         self._bcast_port = broadcast_port
         self._xfer_port = transfer_port
+        self._identity_directory = identity_directory
         self._handles: EngineHandles | None = None
 
     def __enter__(self) -> EngineHandles:
-        self._handles = start_engine(self._bcast_port, self._xfer_port)
+        self._handles = start_engine(
+            self._bcast_port,
+            self._xfer_port,
+            self._identity_directory,
+        )
         return self._handles
 
     def __exit__(self, *exc) -> None:

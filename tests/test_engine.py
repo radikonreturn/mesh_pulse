@@ -4,12 +4,10 @@ from __future__ import annotations
 
 import time
 
-
-from mesh_pulse.core.engine import EngineHandles, MeshEngine, start_engine, stop_engine
 from mesh_pulse.core.discovery import PeerDiscovery, PeerManager
+from mesh_pulse.core.engine import EngineHandles, MeshEngine, start_engine, stop_engine
 from mesh_pulse.core.monitor import SystemMonitor
 from mesh_pulse.core.transfer import FileClient, FileServer
-
 
 # ── start_engine / stop_engine ──────────────────────────────────────
 

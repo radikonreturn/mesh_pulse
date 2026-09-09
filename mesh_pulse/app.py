@@ -11,33 +11,36 @@ import os
 import platform
 import subprocess
 from pathlib import Path
-import psutil
+from typing import ClassVar
 
+import psutil
+from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Vertical, Horizontal
+from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import (
-    Input,
-    Static,
     Button,
-    Label,
-    Select,
     DirectoryTree,
-    ListView,
+    Input,
+    Label,
     ListItem,
+    ListView,
+    Select,
+    Static,
 )
 
 from mesh_pulse.core.discovery import PeerManager, UDPBroadcaster
+from mesh_pulse.core.identity import DeviceIdentity
 from mesh_pulse.core.monitor import SystemMonitor
 from mesh_pulse.core.transfer import SecureTransfer, TransferInfo, TransferStatus
+from mesh_pulse.core.trust import TrustStatus, TrustStore
 from mesh_pulse.tui.dashboard import DashboardScreen
+from mesh_pulse.tui.screens.peer_detail import PeerDetailScreen
 from mesh_pulse.tui.screens.settings import SettingsScreen
 from mesh_pulse.tui.widgets.event_log import EventLog
-from mesh_pulse.tui.widgets.peer_detail import PeerDetailModal
 from mesh_pulse.utils.config import (
     BROADCAST_PORT,
-    DEFAULT_KEY,
     RECEIVE_DIR,
     TRANSFER_PORT,
 )
@@ -77,20 +80,23 @@ class SendFileModal(ModalScreen):
     }
 
     #modal-box {
-        width: 100;
-        height: 36;
-        background: #0d1117;
-        border: thick #0ea5e9;
-        border-title-color: #0ea5e9;
+        width: 92%;
+        max-width: 100;
+        min-width: 60;
+        height: 90%;
+        max-height: 36;
+        min-height: 22;
+        background: $surface;
+        border: solid $accent;
         padding: 1 2;
     }
 
     /* ── Title ── */
     #modal-title {
         width: 100%;
-        text-align: center;
+        text-align: left;
         text-style: bold;
-        color: #58a6ff;
+        color: $text;
         padding: 0 0 1 0;
     }
 
@@ -104,8 +110,7 @@ class SendFileModal(ModalScreen):
 
     /* ── Left panel — file browser ── */
     #browser-panel {
-        border: round #1d76db;
-        border-title-color: #58a6ff;
+        border: solid $panel;
         height: 100%;
         overflow-y: auto;
         padding: 0;
@@ -125,13 +130,13 @@ class SendFileModal(ModalScreen):
     }
 
     .section-label {
-        color: #58a6ff;
+        color: $text;
         text-style: bold;
         margin: 1 0 0 0;
     }
 
     .form-label {
-        color: #8b949e;
+        color: $text-muted;
         margin: 1 0 0 0;
     }
 
@@ -150,15 +155,15 @@ class SendFileModal(ModalScreen):
     #manual-ip {
         width: 100%;
         margin: 0 0 0 0;
-        background: #161b22;
-        border: tall #30363d;
-        color: #e6edf3;
+        background: $surface-darken-1;
+        border: tall $panel;
+        color: $text;
     }
 
     /* ── Selection counter ── */
     #selection-counter {
         width: 100%;
-        color: #3fb950;
+        color: $success;
         text-style: bold;
         margin: 0;
         height: 1;
@@ -171,16 +176,16 @@ class SendFileModal(ModalScreen):
         height: 1fr;
         min-height: 4;
         padding: 0;
-        background: #161b22;
-        border: tall #30363d;
+        background: $surface-darken-1;
+        border: tall $panel;
         overflow-y: auto;
     }
 
     #file-list ListItem {
         height: 1;
         padding: 0 1;
-        color: #e6edf3;
-        background: #161b22;
+        color: $text;
+        background: $surface-darken-1;
     }
 
     #file-list ListItem:hover {
@@ -197,9 +202,9 @@ class SendFileModal(ModalScreen):
         height: 1fr;
         min-height: 4;
         padding: 1 1;
-        background: #161b22;
-        border: tall #30363d;
-        color: #484f58;
+        background: $surface-darken-1;
+        border: tall $panel;
+        color: $text-muted;
         text-style: italic;
     }
 
@@ -207,9 +212,9 @@ class SendFileModal(ModalScreen):
     #transfer-message {
         width: 100%;
         margin: 0;
-        background: #161b22;
-        border: tall #30363d;
-        color: #e6edf3;
+        background: $surface-darken-1;
+        border: tall $panel;
+        color: $text;
     }
 
     /* ── Button row ── */
@@ -223,7 +228,7 @@ class SendFileModal(ModalScreen):
 
     #shortcut-hints {
         width: 100%;
-        color: #484f58;
+        color: $text-muted;
         text-align: center;
         height: 1;
         margin: 0;
@@ -249,9 +254,30 @@ class SendFileModal(ModalScreen):
         margin: 0 1;
         min-width: 14;
     }
+
+    SendFileModal.compact #modal-box {
+        width: 96%;
+        min-width: 40;
+        height: 96%;
+        max-height: 100%;
+        padding: 0 1;
+    }
+
+    SendFileModal.compact #modal-body {
+        layout: vertical;
+    }
+
+    SendFileModal.compact #browser-panel {
+        height: 1fr;
+        margin: 0;
+    }
+
+    SendFileModal.compact #details-panel {
+        height: 14;
+    }
     """
 
-    BINDINGS = [
+    BINDINGS: ClassVar[list[Binding]] = [
         Binding("escape", "cancel", "Cancel", show=False),
     ]
 
@@ -268,6 +294,11 @@ class SendFileModal(ModalScreen):
         self._preselect_ip = preselect_ip
         self._selected_files: list[str] = []
         self._selected_folders: list[str] = []
+
+    @property
+    def preselected_peer_ip(self) -> str | None:
+        """Peer IP requested by the launching workspace, if any."""
+        return self._preselect_ip
 
     # ── Helpers ──────────────────────────────────────────────
 
@@ -299,15 +330,15 @@ class SendFileModal(ModalScreen):
         drives = []
         if platform.system() == "Windows":
             for p in psutil.disk_partitions(all=False):
-                drives.append((f"💾 {p.device}", p.mountpoint))
+                drives.append((p.device, p.mountpoint))
         else:
-            drives.append(("💾 Root (/)", "/"))
+            drives.append(("Root (/)", "/"))
             for p in psutil.disk_partitions(all=True):
                 if (
                     p.mountpoint.startswith("/mnt/")
                     or p.mountpoint.startswith("/media/")
                 ) and len(p.mountpoint.split("/")) == 3:
-                    drives.append((f"💾 {p.mountpoint}", p.mountpoint))
+                    drives.append((p.mountpoint, p.mountpoint))
 
         seen = set()
         unique_drives = []
@@ -321,7 +352,7 @@ class SendFileModal(ModalScreen):
 
     def compose(self) -> ComposeResult:
         if self._peer_ips:
-            options = [(f"📡  {ip}", ip) for ip in self._peer_ips]
+            options = [(ip, ip) for ip in self._peer_ips]
         else:
             options = [("No peers discovered", "__none__")]
 
@@ -334,12 +365,13 @@ class SendFileModal(ModalScreen):
 
         # Pre-selected IP value
         from typing import Any
+
         peer_value: Any = Select.NULL
         if self._preselect_ip and self._preselect_ip in self._peer_ips:
             peer_value = self._preselect_ip
 
         with Vertical(id="modal-box"):
-            yield Static("📡  Initiate File Transfer", id="modal-title")
+            yield Static("Send files", id="modal-title")
 
             with Horizontal(id="modal-body"):
                 # ── Left: file browser ──
@@ -351,7 +383,7 @@ class SendFileModal(ModalScreen):
                         value=initial_drive,
                     )
                     yield Static(
-                        "📂 Browse — click to select / deselect",
+                        "Browse · select files or folders",
                         classes="form-label",
                     )
                     yield DirectoryTree(self._start_path, id="file-tree")
@@ -359,7 +391,7 @@ class SendFileModal(ModalScreen):
                 # ── Right: transfer details ──
                 with Vertical(id="details-panel"):
                     # Recipient section
-                    yield Static("🎯 Recipient", classes="section-label")
+                    yield Static("Recipient", classes="section-label")
                     yield Select(
                         options,
                         id="peer-select",
@@ -376,7 +408,8 @@ class SendFileModal(ModalScreen):
 
                     # Selected files section
                     yield Static(
-                        "📦 Selected Items  (click to remove)", classes="section-label"
+                        "Selected items · select again to remove",
+                        classes="section-label",
                     )
                     yield Static("", id="selection-counter")
                     yield Static(
@@ -386,7 +419,7 @@ class SendFileModal(ModalScreen):
                     yield ListView(id="file-list")
 
                     # Message section
-                    yield Static("💬 Message", classes="section-label")
+                    yield Static("Message", classes="section-label")
                     yield Input(
                         placeholder="Optional note to recipient…",
                         id="transfer-message",
@@ -400,13 +433,16 @@ class SendFileModal(ModalScreen):
                 )
                 with Horizontal(id="btn-container"):
                     yield Button(
-                        "✓ Send",
+                        "Send",
                         variant="success",
                         id="send-btn",
                         disabled=True,
                     )
-                    yield Button("✗ Clear", variant="warning", id="clear-btn")
-                    yield Button("✗ Cancel", variant="error", id="cancel-btn")
+                    yield Button("Clear", variant="warning", id="clear-btn")
+                    yield Button("Cancel", id="cancel-btn")
+
+    def on_resize(self, event: events.Resize) -> None:
+        self.set_class(event.size.width < 80 or event.size.height < 30, "compact")
 
     # ── Event Handlers ──────────────────────────────────────────
 
@@ -461,7 +497,7 @@ class SendFileModal(ModalScreen):
             total_size += size
             item = ListItem(
                 Label(
-                    f"📁 {name}/  ({self._human_size(size)})", classes="file-item-label"
+                    f"{name}/  ({self._human_size(size)})", classes="file-item-label"
                 ),
                 name=fp,
             )
@@ -472,9 +508,7 @@ class SendFileModal(ModalScreen):
             size = self._get_size(fp)
             total_size += size
             item = ListItem(
-                Label(
-                    f"📄 {name}  — {self._human_size(size)}", classes="file-item-label"
-                ),
+                Label(f"{name}  — {self._human_size(size)}", classes="file-item-label"),
                 name=fp,
             )
             file_list.append(item)
@@ -484,9 +518,7 @@ class SendFileModal(ModalScreen):
             parts.append(f"{n_files} file{'s' if n_files > 1 else ''}")
         if n_folders:
             parts.append(f"{n_folders} folder{'s' if n_folders > 1 else ''}")
-        counter.update(
-            f"  📊 {', '.join(parts)}  ·  {self._human_size(total_size)} total"
-        )
+        counter.update(f"  {', '.join(parts)}  ·  {self._human_size(total_size)} total")
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         """Deselect a file/folder when clicked in the selected items list."""
@@ -560,11 +592,11 @@ class SendFileModal(ModalScreen):
 class MeshPulseApp(App):
     """Mesh-Pulse Command Center — TUI Application."""
 
-    TITLE = "⚡ Mesh-Pulse Command Center"
-    SUB_TITLE = "Network Mesh & System Resource Monitor"
+    TITLE = "Mesh-Pulse"
+    SUB_TITLE = "Local encrypted peer workspace"
     CSS_PATH = Path(__file__).parent / "tui" / "styles" / "dashboard.tcss"
 
-    BINDINGS = [
+    BINDINGS: ClassVar[list[Binding]] = [
         Binding("q", "quit", "Quit", priority=True),
         Binding("s", "send_file", "Send File"),
         Binding("p", "peer_detail", "Peer Detail"),
@@ -577,26 +609,35 @@ class MeshPulseApp(App):
 
     def __init__(
         self,
-        passphrase: str = DEFAULT_KEY,
+        passphrase: str | None = None,
         broadcast_port: int = BROADCAST_PORT,
         transfer_port: int = TRANSFER_PORT,
+        identity_directory: str | Path | None = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
         self.event_log = EventLog()
+        self.legacy_mode = passphrase is not None
         self.monitor = SystemMonitor()
-        self.peer_manager = PeerManager()
+        self.identity = DeviceIdentity.load_or_create(identity_directory)
+        self.trust_store = TrustStore(self.identity.directory / "trusted_devices.json")
+        self.peer_manager = PeerManager(trust_store=self.trust_store)
         self.broadcaster = UDPBroadcaster(
             peer_manager=self.peer_manager,
             broadcast_port=broadcast_port,
             transfer_port=transfer_port,
             local_metrics_fn=lambda: self.monitor.latest.to_broadcast_dict(),
+            identity=self.identity,
         )
         self.transfer = SecureTransfer(
-            passphrase=passphrase,
+            passphrase=passphrase or "",
             transfer_port=transfer_port,
             receive_dir=RECEIVE_DIR,
             on_file_received=self._on_file_received,
+            identity=self.identity,
+            trust_store=self.trust_store,
+            peer_resolver=self.peer_manager.get_peer,
+            legacy_mode=self.legacy_mode,
         )
 
     def _on_file_received(self, info: TransferInfo) -> None:
@@ -604,14 +645,14 @@ class MeshPulseApp(App):
         size_mb = info.filesize / (1024 * 1024)
         if info.status == TransferStatus.COMPLETE:
             msg = (
-                f"📥 Received '{info.filename}' from {info.peer_ip} "
+                f"Received '{info.filename}' from {info.peer_ip} "
                 f"({size_mb:.1f} MB, {info.speed_mbps:.1f} MB/s)"
             )
             level = "success"
             severity = "information"
         else:
             msg = (
-                f"❌ Failed to receive '{info.filename}' from {info.peer_ip}: "
+                f"Failed to receive '{info.filename}' from {info.peer_ip}: "
                 f"{info.error or 'Unknown error'}"
             )
             level = "error"
@@ -619,9 +660,12 @@ class MeshPulseApp(App):
 
         try:
             self.call_from_thread(self.event_log.log, msg, level)
-            self.call_from_thread(self.notify, msg, severity=severity)
-        except Exception:
-            pass
+            user_message = (
+                msg if info.status == TransferStatus.COMPLETE else "Transfer failed."
+            )
+            self.call_from_thread(self.notify, user_message, severity=severity)
+        except RuntimeError as error:
+            log.debug("Unable to post transfer notification: %s", error)
 
     def on_mount(self) -> None:
         """Start all background subsystems when the app mounts."""
@@ -644,8 +688,8 @@ class MeshPulseApp(App):
                 event_log=self.event_log,
             )
         )
-        self.event_log.log("Dashboard loaded — all systems operational", "success")
-        log.info("Dashboard loaded — all systems operational")
+        self.event_log.log("Dashboard ready", "success")
+        log.info("Dashboard ready")
 
     # ── Actions ────────────────────────────────────────────────────
 
@@ -654,12 +698,35 @@ class MeshPulseApp(App):
 
     def action_send_file(self, preselect_ip: str | None = None) -> None:
         """Open the file picker modal populated with discovered peers."""
+        if preselect_ip is None and isinstance(self.screen, DashboardScreen):
+            selected = self.screen.selected_peer
+            if selected is not None:
+                preselect_ip = selected.ip
+        selected_peer = (
+            self.peer_manager.get_peer(preselect_ip) if preselect_ip else None
+        )
+        if (
+            selected_peer is not None
+            and not self.legacy_mode
+            and selected_peer.trust_status != TrustStatus.TRUSTED
+        ):
+            self.notify("Trust this device before sending.", severity="warning")
+            return
         peers = self.peer_manager.get_peers()
         peer_ips = [p.ip for p in peers]
 
         def _on_result(result: tuple[str, list[str], str] | None) -> None:
             if result:
                 peer_ip, items, message = result
+                peer = self.peer_manager.get_peer(peer_ip)
+                if not self.legacy_mode and (
+                    peer is None or peer.trust_status != TrustStatus.TRUSTED
+                ):
+                    self.event_log.log(
+                        f"Blocked transfer to untrusted peer {peer_ip}", "warning"
+                    )
+                    self.notify("Device is not trusted.", severity="warning")
+                    return
                 all_files: list[str] = []
                 for item in items:
                     if os.path.isdir(item):
@@ -689,26 +756,29 @@ class MeshPulseApp(App):
             callback=_on_result,
         )
 
+    def action_open_peer(self, peer_id: str) -> None:
+        """Open a peer-centric workspace by stable peer identifier."""
+        peer = self.peer_manager.get_peer(peer_id)
+        if peer is None:
+            self.notify("Peer went offline.", severity="warning")
+            return
+        self.push_screen(
+            PeerDetailScreen(
+                peer_id=peer.stable_id,
+                peer_manager=self.peer_manager,
+                transfer_engine=self.transfer,
+                trust_store=self.trust_store,
+            )
+        )
+
     def action_peer_detail(self) -> None:
-        """Open Peer Detail modal for the most-recently-seen online peer."""
-        peers = [
-            p
-            for p in self.peer_manager.get_peers()
-            if p.status.value == "online"
-        ]
-        if not peers:
+        """Open details for the selected dashboard peer."""
+        screen = self.screen
+        peer = screen.selected_peer if isinstance(screen, DashboardScreen) else None
+        if peer is None:
             self.notify("No online peers to inspect", severity="warning")
             return
-
-        # Show the most recently seen peer
-        peer = sorted(peers, key=lambda p: p.last_seen, reverse=True)[0]
-
-        def _on_peer_result(result: str | None) -> None:
-            if result:
-                # User clicked "Send File" from the peer detail modal
-                self.action_send_file(preselect_ip=result)
-
-        self.push_screen(PeerDetailModal(peer=peer), callback=_on_peer_result)
+        self.action_open_peer(peer.stable_id)
 
     def action_open_received(self) -> None:
         """Open the received-files folder in the system file explorer."""
@@ -723,9 +793,11 @@ class MeshPulseApp(App):
             else:
                 subprocess.Popen(["xdg-open", str(folder)])
             self.event_log.log(f"Opened received files folder: {folder}", "info")
-        except Exception as e:
+        except (OSError, subprocess.SubprocessError) as e:
             self.event_log.log(f"Could not open folder: {e}", "error")
-            self.notify(str(folder), title="Received Files Folder", severity="information")
+            self.notify(
+                str(folder), title="Received Files Folder", severity="information"
+            )
 
     def action_settings(self) -> None:
         """Open the Settings screen."""

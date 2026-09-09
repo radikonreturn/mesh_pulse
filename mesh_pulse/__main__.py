@@ -12,15 +12,14 @@ Options:
 import click
 
 from mesh_pulse import __version__
-from mesh_pulse.utils.config import BROADCAST_PORT, DEFAULT_KEY, TRANSFER_PORT
+from mesh_pulse.utils.config import BROADCAST_PORT, TRANSFER_PORT
 
 
 @click.command()
 @click.option(
     "--key",
-    default=DEFAULT_KEY,
     envvar="MESH_PULSE_KEY",
-    help="Encryption passphrase for file transfers.",
+    help="Enable explicit legacy v2 transfers with this shared passphrase.",
 )
 @click.option(
     "--broadcast-port",
@@ -35,8 +34,8 @@ from mesh_pulse.utils.config import BROADCAST_PORT, DEFAULT_KEY, TRANSFER_PORT
     help=f"TCP transfer port (default: {TRANSFER_PORT}).",
 )
 @click.version_option(version=__version__, prog_name="mesh-pulse")
-def main(key: str, broadcast_port: int, transfer_port: int) -> None:
-    """⚡ Mesh-Pulse — Network Mesh & System Resource Monitor."""
+def main(key: str | None, broadcast_port: int, transfer_port: int) -> None:
+    """Mesh-Pulse — local encrypted peer workspace."""
     from mesh_pulse.app import MeshPulseApp
 
     app = MeshPulseApp(

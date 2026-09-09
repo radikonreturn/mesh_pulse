@@ -1,21 +1,20 @@
-"""Peer list widget — live-updating table of discovered network nodes.
-
-Columns: Status indicator, Hostname, IP Address, CPU, RAM, Latency, Last Seen.
-Latency values come from LatencyProber (real TCP connect-time measurements).
-"""
+"""Keyboard-first peer browser for the dashboard."""
 
 from __future__ import annotations
 
-from rich.table import Table
-from rich.text import Text
-from textual.widgets import Static
+from textual.app import ComposeResult
+from textual.containers import Vertical
+from textual.widgets import DataTable, Static
 
 from mesh_pulse.core.discovery import Peer, PeerManager, PeerStatus
 
 
-class PeerListWidget(Static):
-    """Displays a live list of discovered peers with real latency measurements,
-    status indicators, remote metrics, and last-seen timestamps.
+class PeerListWidget(Vertical):
+    """Selectable, live-updating list of discovered peers.
+
+    Rows use a stable peer key, so refreshing metrics does not reset the
+    cursor. If the selected peer disappears, the cursor moves to the nearest
+    remaining row instead of jumping to the beginning.
     """
 
     DEFAULT_CSS = """
@@ -23,122 +22,142 @@ class PeerListWidget(Static):
         height: 100%;
         padding: 0 1;
     }
+
+    PeerListWidget #peer-list-title {
+        height: 2;
+        padding-top: 1;
+        color: $text;
+        text-style: bold;
+    }
+
+    PeerListWidget #peer-table {
+        height: 1fr;
+        border: none;
+        background: transparent;
+    }
+
+    PeerListWidget #peer-empty {
+        height: 1fr;
+        padding: 1 0;
+        color: $text-muted;
+    }
     """
 
     def __init__(self, peer_manager: PeerManager, **kwargs):
         super().__init__(**kwargs)
         self._pm = peer_manager
+        self._selected_key: str | None = None
+
+    def compose(self) -> ComposeResult:
+        yield Static("PEERS", id="peer-list-title")
+        yield DataTable(
+            id="peer-table",
+            cursor_type="row",
+            zebra_stripes=True,
+        )
+        yield Static(
+            "No peers discovered\n\n"
+            "Scanning the local network…\n"
+            "Devices running Mesh-Pulse will appear automatically.",
+            id="peer-empty",
+        )
 
     def on_mount(self) -> None:
+        table = self.query_one("#peer-table", DataTable)
+        table.add_columns(
+            "Status",
+            "Hostname",
+            "IP",
+            "CPU",
+            "RAM",
+            "Latency",
+            "Last Seen",
+            "Trust",
+        )
         self.refresh_peers()
         self.set_interval(2.0, self.refresh_peers)
+        table.focus()
+
+    @property
+    def selected_peer(self) -> Peer | None:
+        """Return the currently selected peer, if it still exists."""
+        if self._selected_key is None:
+            return None
+        return self._pm.get_peer(self._selected_key)
+
+    @property
+    def selected_key(self) -> str | None:
+        """Stable key of the current row, exposed for screen actions/tests."""
+        return self._selected_key
 
     def refresh_peers(self) -> None:
-        """Rebuild the peer table from current PeerManager state."""
-        peers = self._pm.get_peers()
-        table = Table(
-            title="🌐 NETWORK MESH",
-            title_style="bold cyan",
-            expand=True,
-            show_header=True,
-            header_style="bold bright_white on grey23",
-            border_style="bright_cyan",
-            padding=(0, 1),
-            show_lines=False,
-        )
-        table.add_column("", width=2, justify="center")
-        table.add_column(
-            "Host", style="bold white", min_width=10, ratio=2, no_wrap=True
-        )
-        table.add_column("IP Address", style="white", min_width=15, no_wrap=True)
-        table.add_column("Status", justify="center", width=8, no_wrap=True)
-        table.add_column("CPU", justify="right", width=5)
-        table.add_column("RAM", justify="right", width=5)
-        table.add_column("Latency", justify="right", width=9)
-        table.add_column("Last Seen", justify="right", width=9, no_wrap=True)
+        """Refresh peer data while retaining the selected stable row key."""
+        table = self.query_one("#peer-table", DataTable)
+        empty = self.query_one("#peer-empty", Static)
+        peers = sorted(self._pm.get_peers(), key=lambda peer: peer.hostname.lower())
 
-        if not peers:
+        previous_key = self._cursor_key(table) or self._selected_key
+        previous_row = table.cursor_row
+        table.clear(columns=False)
+
+        for peer in peers:
             table.add_row(
-                "",
-                Text("Scanning network...", style="dim italic"),
-                "",
-                "",
-                "",
-                "",
-                "",
-                "",
+                self._status_text(peer),
+                peer.hostname,
+                peer.ip,
+                f"{peer.metrics.cpu_percent:.0f}%",
+                f"{peer.metrics.ram_percent:.0f}%",
+                self.format_latency(peer.latency_ms),
+                self.format_last_seen(peer.age),
+                self._trust_text(peer),
+                key=peer.stable_id,
             )
+
+        has_peers = bool(peers)
+        table.display = has_peers
+        empty.display = not has_peers
+        if not has_peers:
+            self._selected_key = None
+            return
+
+        keys = [peer.stable_id for peer in peers]
+        if previous_key in keys:
+            cursor_row = keys.index(previous_key)
         else:
-            for peer in sorted(peers, key=lambda p: p.last_seen, reverse=True):
-                indicator = self._status_dot(peer)
-                status_text = self._status_badge(peer)
-                cpu_text = Text(
-                    f"{peer.metrics.cpu_percent:.0f}%",
-                    style=self._load_color(peer.metrics.cpu_percent),
-                )
-                ram_text = Text(
-                    f"{peer.metrics.ram_percent:.0f}%",
-                    style=self._load_color(peer.metrics.ram_percent),
-                )
-                latency_text = self._format_latency(peer.latency_ms)
-                last_seen = self._format_last_seen(peer.age)
+            cursor_row = min(previous_row, len(keys) - 1)
+        table.move_cursor(row=cursor_row, column=0, animate=False)
+        self._selected_key = keys[cursor_row]
 
-                table.add_row(
-                    indicator,
-                    peer.hostname,
-                    peer.ip,
-                    status_text,
-                    cpu_text,
-                    ram_text,
-                    latency_text,
-                    last_seen,
-                )
-
-        self.update(table)
+    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        if event.data_table.id == "peer-table":
+            self._selected_key = event.row_key.value
 
     @staticmethod
-    def _status_dot(peer: Peer) -> Text:
-        if peer.status == PeerStatus.ONLINE:
-            return Text("●", style="bold green")
-        return Text("●", style="bold red")
+    def _cursor_key(table: DataTable) -> str | None:
+        if not table.row_count or not table.is_valid_row_index(table.cursor_row):
+            return None
+        return table.ordered_rows[table.cursor_row].key.value
 
     @staticmethod
-    def _status_badge(peer: Peer) -> Text:
-        if peer.status == PeerStatus.ONLINE:
-            return Text("ONLINE", style="bold green")
-        return Text("STALE", style="bold red")
+    def _status_text(peer: Peer) -> str:
+        return "●" if peer.status == PeerStatus.ONLINE else "○"
 
     @staticmethod
-    def _format_latency(ms: float | None) -> Text:
-        """Format real TCP latency measurement."""
-        if ms is None:
-            return Text("probing…", style="dim")
-        return Text(f"{ms:.0f} ms", style=PeerListWidget._latency_color(ms))
+    def _trust_text(peer: Peer) -> str:
+        trust_status = getattr(peer, "trust_status", None)
+        value = getattr(trust_status, "value", trust_status)
+        return str(value or "new").upper()
 
     @staticmethod
-    def _format_last_seen(age: float) -> Text:
+    def format_latency(ms: float | None) -> str:
+        """Format a measured TCP latency for compact table display."""
+        return "probing…" if ms is None else f"{ms:.0f} ms"
+
+    @staticmethod
+    def format_last_seen(age: float) -> str:
+        """Format an age using the shortest useful unit."""
         if age < 60:
-            return Text(f"{age:.0f}s ago", style="dim bright_white")
-        elif age < 3600:
-            return Text(f"{age / 60:.0f}m ago", style="dim yellow")
-        return Text(f"{age / 3600:.0f}h ago", style="dim red")
-
-    @staticmethod
-    def _latency_color(ms: float) -> str:
-        if ms < 5:
-            return "bold bright_green"
-        elif ms < 30:
-            return "bold green"
-        elif ms < 100:
-            return "bold yellow"
-        return "bold red"
-
-    @staticmethod
-    def _load_color(percent: float) -> str:
-        if percent >= 90:
-            return "bold red"
-        elif percent >= 70:
-            return "bold yellow"
-        elif percent >= 50:
-            return "bold bright_yellow"
-        return "bold green"
+            return f"{age:.0f}s ago"
+        if age < 3600:
+            return f"{age / 60:.0f}m ago"
+        return f"{age / 3600:.0f}h ago"

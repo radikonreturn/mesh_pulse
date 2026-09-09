@@ -1,9 +1,11 @@
 """Tests for AES-256-GCM encryption/decryption utilities."""
 
 import os
-import pytest
 
-from mesh_pulse.utils.crypto import derive_key, encrypt_chunk, decrypt_chunk
+import pytest
+from cryptography.exceptions import InvalidTag
+
+from mesh_pulse.utils.crypto import decrypt_chunk, derive_key, encrypt_chunk
 
 
 class TestKeyDerivation:
@@ -71,7 +73,7 @@ class TestEncryptDecrypt:
         key1, _ = derive_key("correct-key")
         key2, _ = derive_key("wrong-key")
         encrypted = encrypt_chunk(b"secret", key1)
-        with pytest.raises(Exception):
+        with pytest.raises(InvalidTag):
             decrypt_chunk(encrypted, key2)
 
     def test_tampered_ciphertext_fails(self):
@@ -80,7 +82,7 @@ class TestEncryptDecrypt:
         # Flip a byte in the ciphertext
         tampered = bytearray(encrypted)
         tampered[-1] ^= 0xFF
-        with pytest.raises(Exception):
+        with pytest.raises(InvalidTag):
             decrypt_chunk(bytes(tampered), key)
 
     def test_encrypted_size_larger_than_plaintext(self):

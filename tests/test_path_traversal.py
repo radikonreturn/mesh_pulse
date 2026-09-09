@@ -19,7 +19,6 @@ import pytest
 from mesh_pulse.core.transfer import FileServer
 from mesh_pulse.utils.crypto import derive_session_key, encrypt_chunk, pack_frame
 
-
 TEST_PORT = 11000
 TEST_PASSPHRASE = "traversal-test-key"
 TEST_RECEIVE_DIR = "test_received_traversal"

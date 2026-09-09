@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import time
 
+from rich.console import Group
 from rich.progress_bar import ProgressBar
 from rich.text import Text
-from rich.console import Group
 from textual.widgets import Static
 
 from mesh_pulse.core.transfer import (
@@ -65,7 +65,7 @@ class TransferBarWidget(Static):
         )
 
         header = Text.assemble(
-            ("📁 FILE TRANSFERS", "bold cyan"),
+            ("TRANSFERS", "bold"),
         )
         totals = Text.assemble(
             ("  ↑ ", "bold green"),
@@ -92,13 +92,13 @@ class TransferBarWidget(Static):
                 rows.append(self._render_transfer(xfer))
                 rows.append(Text(""))
         else:
-            rows.append(Text("  No active transfers", style="dim italic"))
-            rows.append(Text("  Press [S] to send a file", style="dim"))
+            rows.append(Text("  No recent transfers", style="dim italic"))
+            rows.append(Text("  Press S to send a file.", style="dim"))
             rows.append(Text(""))
 
         # ── Recent history ──
         if completed:
-            rows.append(Text("  ─── Recent History ───", style="dim bright_cyan"))
+            rows.append(Text("  Recent", style="dim"))
             for xfer in completed[-6:]:
                 rows.append(self._render_history_entry(xfer))
 

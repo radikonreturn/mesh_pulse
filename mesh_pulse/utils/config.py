@@ -14,7 +14,6 @@ import os
 import socket
 from pathlib import Path
 
-
 # ─── Persistent user config ─────────────────────────────────────────
 _CONFIG_FILE = Path.home() / ".mesh_pulse_config.json"
 
@@ -40,9 +39,7 @@ def save_user_config(config: dict) -> None:
         config: Dict containing any subset of configurable keys.
     """
     try:
-        _CONFIG_FILE.write_text(
-            json.dumps(config, indent=2), encoding="utf-8"
-        )
+        _CONFIG_FILE.write_text(json.dumps(config, indent=2), encoding="utf-8")
     except OSError:
         pass
 
@@ -66,28 +63,32 @@ def _get(key: str, env_var: str, default):
 BROADCAST_PORT: int = _get("broadcast_port", "MESH_PULSE_BCAST_PORT", 37020)
 TRANSFER_PORT: int = _get("transfer_port", "MESH_PULSE_XFER_PORT", 5000)
 BROADCAST_ADDR = "255.255.255.255"
-BROADCAST_INTERVAL = 2      # seconds between heartbeats
-PEER_STALE_TIMEOUT = 6      # seconds before marking peer stale
-PEER_DEAD_TIMEOUT = 10      # seconds before removing peer
-PEER_TIMEOUT = 10           # auto-remove unseen peers after N seconds
+BROADCAST_INTERVAL = 2  # seconds between heartbeats
+PEER_STALE_TIMEOUT = 6  # seconds before marking peer stale
+PEER_DEAD_TIMEOUT = 10  # seconds before removing peer
+PEER_TIMEOUT = 10  # auto-remove unseen peers after N seconds
 
 # ─── Transfer ───────────────────────────────────────────────────────
-CHUNK_SIZE = 64 * 1024      # 64 KB per encrypted chunk
-TRANSFER_BACKLOG = 5        # TCP listen backlog
-HEADER_MAX_SIZE = 4096      # max header JSON size in bytes
-MAX_RETRIES = 3             # max send retry attempts
+CHUNK_SIZE = 64 * 1024  # 64 KB per encrypted chunk
+TRANSFER_BACKLOG = 5  # TCP listen backlog
+HEADER_MAX_SIZE = 4096  # max header JSON size in bytes
+MAX_FILES_PER_SESSION = 1024
+MAX_FILE_SIZE = 100 * 1024 * 1024 * 1024  # 100 GiB
+MAX_SESSION_SIZE = 1024 * 1024 * 1024 * 1024  # 1 TiB
+MAX_RETRIES = 3  # max send retry attempts
 RETRY_DELAYS = (1.0, 3.0, 8.0)  # seconds between retry attempts
 
 # ─── Monitoring ─────────────────────────────────────────────────────
-MONITOR_INTERVAL = 2        # seconds between metric snapshots
-METRIC_HISTORY_SIZE = 60    # keep last N snapshots
+MONITOR_INTERVAL = 2  # seconds between metric snapshots
+METRIC_HISTORY_SIZE = 60  # keep last N snapshots
 LATENCY_PROBE_INTERVAL = 5  # seconds between TCP latency probes
 
 # ─── Encryption ─────────────────────────────────────────────────────
+# Compatibility-only v2 passphrase. Normal app launches use protocol v3 identity.
 DEFAULT_KEY: str = _get("default_key", "MESH_PULSE_KEY", "mesh-pulse-default-key")
 PBKDF2_ITERATIONS = 480_000
 SALT_SIZE = 16
-NONCE_SIZE = 12             # AES-GCM standard nonce size
+NONCE_SIZE = 12  # AES-GCM standard nonce size
 
 # ─── Identity ──────────────────────────────────────────────────────
 HOSTNAME = socket.gethostname()

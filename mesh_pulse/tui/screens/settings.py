@@ -1,4 +1,4 @@
-"""In-TUI Settings screen — configure ports, encryption key, and receive directory.
+"""In-TUI Settings screen — configure ports and receive directory.
 
 Keybind: [G] from the main dashboard opens this screen.
 Changes are saved to ~/.mesh_pulse_config.json and take effect on next launch.
@@ -6,15 +6,16 @@ Changes are saved to ~/.mesh_pulse_config.json and take effect on next launch.
 
 from __future__ import annotations
 
+from typing import ClassVar
+
 from textual.app import ComposeResult
 from textual.binding import Binding
-from textual.containers import Vertical, Horizontal
+from textual.containers import Horizontal, Vertical
 from textual.screen import Screen
 from textual.widgets import Button, Input, Label, Static
 
 from mesh_pulse.utils.config import (
     BROADCAST_PORT,
-    DEFAULT_KEY,
     RECEIVE_DIR,
     TRANSFER_PORT,
     load_user_config,
@@ -26,7 +27,6 @@ class SettingsScreen(Screen):
     """Settings screen — edit persistent configuration values.
 
     Fields:
-        Encryption Key    — shared passphrase for AES-256-GCM transfers
         Broadcast Port    — UDP discovery port (default 37020)
         Transfer Port     — TCP file transfer port (default 5000)
         Receive Directory — where incoming files are saved
@@ -120,7 +120,7 @@ class SettingsScreen(Screen):
     }
     """
 
-    BINDINGS = [
+    BINDINGS: ClassVar[list[Binding]] = [
         Binding("escape", "go_back", "Back", priority=True),
         Binding("ctrl+s", "save", "Save"),
     ]
@@ -128,30 +128,15 @@ class SettingsScreen(Screen):
     def compose(self) -> ComposeResult:
         cfg = load_user_config()
 
-        yield Static("⚙  Mesh-Pulse Settings", id="settings-title")
+        yield Static("Mesh-Pulse settings", id="settings-title")
         yield Static(
             "Changes are saved to ~/.mesh_pulse_config.json and apply on next launch",
             id="settings-subtitle",
         )
 
-        # Encryption Key
-        with Vertical(classes="field-group"):
-            yield Label("🔑  Encryption Key", classes="field-label")
-            yield Label(
-                "Shared passphrase — both sender and receiver must use the same key",
-                classes="field-hint",
-            )
-            yield Input(
-                value=cfg.get("default_key", DEFAULT_KEY),
-                placeholder="mesh-pulse-default-key",
-                id="key-input",
-                classes="field-input",
-                password=False,
-            )
-
         # Broadcast Port
         with Vertical(classes="field-group"):
-            yield Label("📡  Broadcast Port (UDP Discovery)", classes="field-label")
+            yield Label("Broadcast port · UDP discovery", classes="field-label")
             yield Label(
                 f"Default: {BROADCAST_PORT}  ·  MESH_PULSE_BCAST_PORT env var overrides this",
                 classes="field-hint",
@@ -165,7 +150,7 @@ class SettingsScreen(Screen):
 
         # Transfer Port
         with Vertical(classes="field-group"):
-            yield Label("🔌  Transfer Port (TCP File Transfer)", classes="field-label")
+            yield Label("Transfer port · TCP", classes="field-label")
             yield Label(
                 f"Default: {TRANSFER_PORT}  ·  MESH_PULSE_XFER_PORT env var overrides this",
                 classes="field-hint",
@@ -179,7 +164,7 @@ class SettingsScreen(Screen):
 
         # Receive Directory
         with Vertical(classes="field-group"):
-            yield Label("📁  Receive Directory", classes="field-label")
+            yield Label("Receive directory", classes="field-label")
             yield Label(
                 "Where incoming files are saved  ·  MESH_PULSE_RECEIVE_DIR env var overrides",
                 classes="field-hint",
@@ -194,9 +179,9 @@ class SettingsScreen(Screen):
         yield Static("", id="divider")
 
         with Horizontal(id="btn-row"):
-            yield Button("💾 Save", variant="success", id="save-btn")
-            yield Button("↺ Reset Defaults", variant="warning", id="reset-btn")
-            yield Button("← Back", variant="error", id="back-btn")
+            yield Button("Save", variant="success", id="save-btn")
+            yield Button("Reset defaults", variant="warning", id="reset-btn")
+            yield Button("Back", id="back-btn")
 
         yield Static("", id="status-bar")
 
@@ -211,10 +196,6 @@ class SettingsScreen(Screen):
     def action_save(self) -> None:
         """Validate inputs and persist to config file."""
         errors = []
-
-        key_val = self.query_one("#key-input", Input).value.strip()
-        if not key_val:
-            errors.append("Encryption key cannot be empty")
 
         try:
             bcast_port = int(self.query_one("#bcast-port-input", Input).value.strip())
@@ -244,23 +225,21 @@ class SettingsScreen(Screen):
 
         save_user_config(
             {
-                "default_key": key_val,
                 "broadcast_port": bcast_port,
                 "transfer_port": xfer_port,
                 "receive_dir": recv_dir,
             }
         )
-        status.update("  ✓  Settings saved — restart to apply port/directory changes")
+        status.update("Settings saved · restart to apply port or directory changes")
         status.styles.color = "green"
 
     def _reset_defaults(self) -> None:
         """Clear the config file and reset inputs to built-in defaults."""
         save_user_config({})
-        self.query_one("#key-input", Input).value = "mesh-pulse-default-key"
         self.query_one("#bcast-port-input", Input).value = str(BROADCAST_PORT)
         self.query_one("#xfer-port-input", Input).value = str(TRANSFER_PORT)
         self.query_one("#recv-dir-input", Input).value = RECEIVE_DIR
-        self.query_one("#status-bar", Static).update("  ↺  Defaults restored")
+        self.query_one("#status-bar", Static).update("Defaults restored")
 
     def action_go_back(self) -> None:
         self.app.pop_screen()

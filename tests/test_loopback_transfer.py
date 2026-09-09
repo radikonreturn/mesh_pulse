@@ -16,7 +16,6 @@ import time
 from unittest.mock import MagicMock
 
 import pytest
-
 from cryptography.fernet import Fernet
 
 from mesh_pulse.core.transfer import (
@@ -26,7 +25,6 @@ from mesh_pulse.core.transfer import (
     TransferInfo,
     TransferStatus,
 )
-
 
 # Use unique high ports for each test to avoid conflicts
 BASE_PORT = 19200

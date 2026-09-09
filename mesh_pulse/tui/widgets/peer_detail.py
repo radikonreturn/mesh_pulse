@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from typing import ClassVar
+
 from rich.table import Table
 from rich.text import Text
 from textual.app import ComposeResult
 from textual.binding import Binding
-from textual.containers import Vertical, Horizontal
+from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Button, Static
 
@@ -79,7 +81,7 @@ class PeerDetailModal(ModalScreen):
     }
     """
 
-    BINDINGS = [
+    BINDINGS: ClassVar[list[Binding]] = [
         Binding("escape", "cancel", "Close", show=False),
         Binding("s", "send_to", "Send File"),
     ]
@@ -109,7 +111,10 @@ class PeerDetailModal(ModalScreen):
             last_seen = f"{age / 3600:.1f}h ago"
 
         import time
-        first_seen_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(p.first_seen))
+
+        first_seen_str = time.strftime(
+            "%Y-%m-%d %H:%M:%S", time.localtime(p.first_seen)
+        )
 
         grid = Table.grid(padding=(0, 2))
         grid.add_column("key", style="bold dim", no_wrap=True)
