@@ -11,6 +11,7 @@ from textual.widgets import DataTable, Static
 from mesh_pulse.core.discovery import Peer, PeerManager
 from mesh_pulse.core.monitor import SystemMonitor
 from mesh_pulse.core.transfer import SecureTransfer
+from mesh_pulse.core.transfer_models import TERMINAL_TRANSFER_STATUSES
 from mesh_pulse.tui.widgets.event_log import EventLog, EventLogWidget
 from mesh_pulse.tui.widgets.peer_list import PeerListWidget
 from mesh_pulse.tui.widgets.system_health import SystemHealthWidget
@@ -24,11 +25,13 @@ class NodeHeader(Static):
     def __init__(
         self,
         peer_manager: PeerManager,
+        transfer_engine: SecureTransfer | None = None,
         legacy_mode: bool = False,
         **kwargs,
     ):
         super().__init__(**kwargs)
         self._pm = peer_manager
+        self._transfer = transfer_engine
         self._legacy_mode = legacy_mode
 
     def on_mount(self) -> None:
@@ -39,13 +42,25 @@ class NodeHeader(Static):
         )
 
     def refresh_status(self) -> None:
-        count = self._pm.count
-        peers = f"{count} peer" if count == 1 else f"{count} peers"
-
+        active = 0
+        if self._transfer is not None:
+            active = sum(
+                transfer.status not in TERMINAL_TRANSFER_STATUSES
+                for transfer in self._transfer.get_transfers()
+            )
+        overview = self._pm.network_overview(active_transfers=active)
         security = "legacy v2" if self._legacy_mode else "authenticated v3"
-
+        latency = (
+            f"{overview.median_latency_ms:.0f} ms median"
+            if overview.median_latency_ms is not None
+            else "latency —"
+        )
         self.update(
-            f"Mesh-Pulse\n[dim]{HOSTNAME} · {LOCAL_IP} · {peers} · {security}[/dim]"
+            "Mesh-Pulse\n"
+            f"[dim]{HOSTNAME} · {LOCAL_IP} · {overview.online} online · "
+            f"{overview.trusted_online} trusted · {overview.untrusted} untrusted · "
+            f"{overview.unavailable} unavailable · {active} active · {latency} · "
+            f"{security}[/dim]"
         )
 
 
@@ -76,6 +91,7 @@ class DashboardScreen(Screen):
     def compose(self) -> ComposeResult:
         yield NodeHeader(
             self._pm,
+            self._transfer,
             legacy_mode=self._legacy_mode,
             id="header",
         )

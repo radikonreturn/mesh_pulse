@@ -26,7 +26,6 @@ Retry:
 from __future__ import annotations
 
 import hashlib
-import json
 import math
 import select
 import socket
@@ -34,12 +33,18 @@ import threading
 import time
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass, field
-from enum import Enum
 from pathlib import Path
 
 from cryptography.exceptions import InvalidTag
 
+from mesh_pulse.core.events import (
+    EventPublisher,
+    IncomingTransferOffered,
+    TransferCompleted,
+    TransferEvent,
+    TransferFailed,
+    TransferUpdated,
+)
 from mesh_pulse.core.history import (
     TransferFileRecord,
     TransferHistoryStore,
@@ -47,6 +52,7 @@ from mesh_pulse.core.history import (
 )
 from mesh_pulse.core.identity import DeviceIdentity
 from mesh_pulse.core.inbox import (
+    InboxCapacityError,
     IncomingRequestManager,
     IncomingRequestStatus,
     IncomingTransferRequest,
@@ -59,11 +65,37 @@ from mesh_pulse.core.session import (
     client_handshake,
     server_handshake,
 )
+from mesh_pulse.core.transfer_lifecycle import is_terminal, set_status
+from mesh_pulse.core.transfer_models import (
+    TERMINAL_TRANSFER_STATUSES,
+    TransferDirection,
+    TransferInfo,
+    TransferStatus,
+)
 from mesh_pulse.core.transfer_protocol import (
     TransferOffer,
     build_response,
+    validate_chunk_control,
     validate_offer,
     validate_response,
+)
+from mesh_pulse.core.transfer_protocol import (
+    receive_control_frame as _recv_frame_json,
+)
+from mesh_pulse.core.transfer_protocol import (
+    receive_data_frame as _recv_frame_bytes,
+)
+from mesh_pulse.core.transfer_protocol import (
+    send_encrypted_frame as _send_frame,
+)
+from mesh_pulse.core.transfer_protocol import (
+    sha256_file as _sha256_of_file,
+)
+from mesh_pulse.core.transfer_protocol import (
+    validate_file_header as _validate_file_header,
+)
+from mesh_pulse.core.transfer_protocol import (
+    validate_session_header as _validate_session_header,
 )
 from mesh_pulse.core.trust import TrustedDevice, TrustStatus, TrustStore
 from mesh_pulse.utils.config import (
@@ -71,8 +103,8 @@ from mesh_pulse.utils.config import (
     CHUNK_TIMEOUT,
     CONNECT_TIMEOUT,
     HANDSHAKE_TIMEOUT,
-    HEADER_MAX_SIZE,
     IDLE_TRANSFER_TIMEOUT,
+    MAX_CONCURRENT_TRANSFER_SESSIONS,
     MAX_FILE_SIZE,
     MAX_FILES_PER_SESSION,
     MAX_RETRIES,
@@ -83,94 +115,10 @@ from mesh_pulse.utils.config import (
     TRANSFER_BACKLOG,
     TRANSFER_PORT,
 )
-from mesh_pulse.utils.crypto import (
-    decrypt_chunk,
-    derive_session_key,
-    encrypt_chunk,
-    pack_frame,
-    unpack_frame,
-)
+from mesh_pulse.utils.crypto import derive_session_key
 from mesh_pulse.utils.logger import get_logger
 
 log = get_logger(__name__)
-
-
-# ─── Data Models ────────────────────────────────────────────────────
-
-
-class TransferDirection(Enum):
-    SEND = "send"
-    RECV = "recv"
-
-
-class TransferStatus(Enum):
-    PENDING = "pending"
-    PENDING_APPROVAL = "pending_approval"
-    ACCEPTED = "accepted"
-    REJECTED = "rejected"
-    ACTIVE = "active"
-    INTERRUPTED = "interrupted"
-    RESUMING = "resuming"
-    COMPLETE = "complete"
-    FAILED = "failed"
-    CANCELLED = "cancelled"
-
-
-@dataclass
-class TransferInfo:
-    """Tracks the state of an active file transfer."""
-
-    filename: str
-    filesize: int
-    direction: TransferDirection
-    peer_ip: str
-    status: TransferStatus = TransferStatus.PENDING
-    bytes_transferred: int = 0
-    started_at: float = field(default_factory=time.time)
-    error: str | None = None
-    retry_count: int = 0
-    peer_device_id: str | None = None
-    transfer_id: str = field(default_factory=lambda: uuid.uuid4().hex)
-    file_id: str | None = None
-    resume_offset: int = 0
-    bytes_transferred_this_attempt: int = 0
-    completed_at: float | None = None
-    message: str | None = None
-    sha256: str | None = None
-    final_path: str | None = None
-
-    @property
-    def progress(self) -> float:
-        """Completion percentage 0.0 – 100.0."""
-        if self.filesize == 0:
-            return 100.0
-        return min(100.0, (self.bytes_transferred / self.filesize) * 100)
-
-    @property
-    def elapsed(self) -> float:
-        return time.time() - self.started_at
-
-    @property
-    def speed_mbps(self) -> float:
-        """Transfer speed in MB/s."""
-        if self.elapsed == 0:
-            return 0.0
-        return (self.bytes_transferred / (1024 * 1024)) / self.elapsed
-
-    def to_dict(self) -> dict:
-        return {
-            "filename": self.filename,
-            "filesize": self.filesize,
-            "direction": self.direction.value,
-            "peer_ip": self.peer_ip,
-            "status": self.status.value,
-            "progress": round(self.progress, 1),
-            "speed_mbps": round(self.speed_mbps, 2),
-            "retry_count": self.retry_count,
-            "peer_device_id": self.peer_device_id,
-            "transfer_id": self.transfer_id,
-            "resume_offset": self.resume_offset,
-        }
 
 
 class TransferRejected(ProtocolError):
@@ -183,120 +131,6 @@ class ApprovalTimeout(ProtocolError):
 
 class TransferCancelled(ConnectionError):
     """A user deliberately cancelled an active transfer."""
-
-
-# ─── Internal helpers ────────────────────────────────────────────────
-
-
-def _send_frame(sock: socket.socket, key: bytes, payload: dict | bytes) -> None:
-    """Encrypt and send a length-prefixed frame.
-
-    Args:
-        sock: Connected socket.
-        key: 32-byte AES-256 key.
-        payload: Dict (serialized to JSON) or raw bytes to encrypt.
-    """
-    if isinstance(payload, dict):
-        raw = json.dumps(payload).encode("utf-8")
-    else:
-        raw = payload
-    encrypted = encrypt_chunk(raw, key)
-    sock.sendall(pack_frame(encrypted))
-
-
-def _recv_frame_json(sock: socket.socket, key: bytes) -> dict:
-    """Receive, decrypt and JSON-parse a control frame.
-
-    Args:
-        sock: Connected socket.
-        key: 32-byte AES-256 key.
-
-    Returns:
-        Parsed dict from the decrypted JSON frame.
-    """
-    encrypted = unpack_frame(sock, max_size=HEADER_MAX_SIZE + 64)
-    raw = decrypt_chunk(encrypted, key)
-    try:
-        payload = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise ProtocolError("Invalid transfer control frame") from error
-    if not isinstance(payload, dict):
-        raise ProtocolError("Transfer control frame must be an object")
-    return payload
-
-
-def _recv_frame_bytes(sock: socket.socket, key: bytes) -> bytes:
-    """Receive and decrypt a raw data frame.
-
-    Args:
-        sock: Connected socket.
-        key: 32-byte AES-256 key.
-
-    Returns:
-        Decrypted plaintext bytes.
-    """
-    encrypted = unpack_frame(sock, max_size=CHUNK_SIZE + 64)
-    return decrypt_chunk(encrypted, key)
-
-
-def _validate_session_header(
-    session: dict, expected_version: int
-) -> tuple[int, str | None]:
-    """Validate bounded session metadata before accepting any file frames."""
-    if session.get("type") != "session":
-        raise ProtocolError("Expected session frame")
-    if session.get("version") != expected_version:
-        raise ProtocolError("Protocol version mismatch")
-    count = session.get("count")
-    if (
-        isinstance(count, bool)
-        or not isinstance(count, int)
-        or not 1 <= count <= MAX_FILES_PER_SESSION
-    ):
-        raise ProtocolError("Invalid file count")
-    message = session.get("message")
-    if message is not None and (not isinstance(message, str) or len(message) > 4096):
-        raise ProtocolError("Invalid transfer message")
-    return count, message
-
-
-def _validate_file_header(header: dict) -> tuple[str, int, str]:
-    """Validate and sanitize remote file metadata."""
-    if header.get("type") != "file":
-        raise ProtocolError("Expected file frame")
-    raw_name = header.get("name")
-    if not isinstance(raw_name, str) or not raw_name or len(raw_name) > 255:
-        raise ProtocolError("Invalid filename")
-    filename = Path(raw_name).name
-    if filename in {"", ".", ".."}:
-        raise ProtocolError("Invalid filename")
-    filesize = header.get("size")
-    if (
-        isinstance(filesize, bool)
-        or not isinstance(filesize, int)
-        or not 0 <= filesize <= MAX_FILE_SIZE
-    ):
-        raise ProtocolError("Invalid file size")
-    expected_hash = header.get("sha256")
-    if (
-        not isinstance(expected_hash, str)
-        or len(expected_hash) != 64
-        or any(character not in "0123456789abcdef" for character in expected_hash)
-    ):
-        raise ProtocolError("Invalid SHA-256 digest")
-    return filename, filesize, expected_hash
-
-
-def _sha256_of_file(path: Path) -> str:
-    """Compute SHA-256 hash of a file."""
-    hasher = hashlib.sha256()
-    with open(path, "rb") as f:
-        while True:
-            block = f.read(CHUNK_SIZE)
-            if not block:
-                break
-            hasher.update(block)
-    return hasher.hexdigest()
 
 
 # ─── FileServer (Threaded TCP Receiver) ───────────────────────────
@@ -361,6 +195,12 @@ class FileServer(threading.Thread):
         self._transfers: list[TransferInfo] = []
         self._transfer_index: dict[tuple[str, str], TransferInfo] = {}
         self._lock = threading.Lock()
+        self._session_slots = threading.BoundedSemaphore(
+            MAX_CONCURRENT_TRANSFER_SESSIONS
+        )
+        self._resource_lock = threading.RLock()
+        self._connections: set[socket.socket] = set()
+        self._handlers: set[threading.Thread] = set()
 
     def _get_or_create_v3_transfer(
         self,
@@ -379,15 +219,14 @@ class FileServer(threading.Thread):
             key = (transfer_id, file_id)
             existing = self._transfer_index.get(key)
             if existing is not None:
-                existing.status = (
-                    TransferStatus.RESUMING if resume_offset else TransferStatus.ACTIVE
-                )
+                if not is_terminal(existing.status):
+                    set_status(existing, TransferStatus.RESUMING)
+                    existing.error = None
+                    existing.final_path = None
+                    existing.completed_at = None
                 existing.resume_offset = resume_offset
                 existing.bytes_transferred = resume_offset
                 existing.bytes_transferred_this_attempt = 0
-                existing.error = None
-                existing.final_path = None
-                existing.completed_at = None
                 if sha256 and not existing.sha256:
                     existing.sha256 = sha256
                 info = existing
@@ -436,12 +275,19 @@ class FileServer(threading.Thread):
         while self._running.is_set():
             try:
                 conn, addr = self._server_socket.accept()
+                if not self._session_slots.acquire(blocking=False):
+                    log.warning("Transfer session limit reached; rejecting %s", addr[0])
+                    conn.close()
+                    continue
                 handler = threading.Thread(
-                    target=self._receive_session,
+                    target=self._session_worker,
                     args=(conn, addr[0]),
                     daemon=True,
                     name=f"recv-{addr[0]}",
                 )
+                with self._resource_lock:
+                    self._connections.add(conn)
+                    self._handlers.add(handler)
                 handler.start()
             except TimeoutError:
                 continue
@@ -454,18 +300,50 @@ class FileServer(threading.Thread):
         log.info("FileServer stopped")
 
     def shutdown(self) -> None:
-        """Signal the server to stop."""
+        """Stop accepting and wake bounded active/pending session workers."""
         self._running.clear()
+        if self._incoming_manager is not None:
+            self._incoming_manager.cancel_all()
         if self._server_socket:
             try:
                 self._server_socket.close()
             except OSError:
                 pass
+        with self._resource_lock:
+            connections = tuple(self._connections)
+            handlers = tuple(self._handlers)
+        for connection in connections:
+            try:
+                connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            connection.close()
+        deadline = time.monotonic() + 1.0
+        for handler in handlers:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            handler.join(timeout=remaining)
+
+    def _session_worker(self, conn: socket.socket, peer_ip: str) -> None:
+        try:
+            self._receive_session(conn, peer_ip)
+        finally:
+            with self._resource_lock:
+                self._connections.discard(conn)
+                self._handlers.discard(threading.current_thread())
+            self._session_slots.release()
 
     def get_transfers(self) -> list[TransferInfo]:
         """Return a snapshot of all transfer records."""
         with self._lock:
             return list(self._transfers)
+
+    @property
+    def active_session_count(self) -> int:
+        """Return active receiver worker count without exposing internals."""
+        with self._resource_lock:
+            return len(self._connections)
 
     def _receive_session(self, conn: socket.socket, peer_ip: str) -> None:
         """Handle a single session connection from a peer."""
@@ -523,7 +401,17 @@ class FileServer(threading.Thread):
                 decision = IncomingRequestStatus.ACCEPTED
                 reason = None
             else:
-                self._incoming_manager.publish(request)
+                try:
+                    self._incoming_manager.publish(request)
+                except InboxCapacityError:
+                    _send_frame(
+                        conn,
+                        session_key,
+                        build_response(offer.transfer_id, False, "Receiver is busy"),
+                    )
+                    return
+                except ValueError as error:
+                    raise ProtocolError("Conflicting transfer request") from error
                 decided = self._await_incoming_decision(
                     conn, session_key, offer.transfer_id
                 )
@@ -626,7 +514,7 @@ class FileServer(threading.Thread):
             )
             try:
                 if state.final_path is None:
-                    info.status = TransferStatus.ACTIVE
+                    set_status(info, TransferStatus.ACTIVE)
                     self._receive_v3_file_data(
                         conn, session_key, offer, offered, state.partial_path, info
                     )
@@ -654,8 +542,7 @@ class FileServer(threading.Thread):
 
                 info.bytes_transferred = offered.size
                 info.final_path = str(final_path)
-                info.status = TransferStatus.COMPLETE
-                info.completed_at = time.time()
+                set_status(info, TransferStatus.COMPLETE)
                 _send_frame(
                     conn,
                     session_key,
@@ -674,20 +561,19 @@ class FileServer(threading.Thread):
                     except (RuntimeError, TypeError, ValueError):
                         log.exception("File-received callback failed")
             except TransferCancelled as error:
-                info.status = TransferStatus.CANCELLED
-                info.error = str(error)
-                info.completed_at = time.time()
+                set_status(info, TransferStatus.CANCELLED, error=str(error))
                 self._notify()
                 return
             except (ProtocolError, InvalidTag, ValueError) as error:
-                info.status = TransferStatus.FAILED
-                info.error = str(error)
-                info.completed_at = time.time()
+                set_status(info, TransferStatus.FAILED, error=str(error))
                 self._notify()
                 raise
             except (ConnectionError, OSError, TimeoutError):
-                info.status = TransferStatus.INTERRUPTED
-                info.error = "Connection interrupted"
+                set_status(
+                    info,
+                    TransferStatus.INTERRUPTED,
+                    error="Connection interrupted",
+                )
                 self._notify()
                 raise
 
@@ -722,18 +608,14 @@ class FileServer(threading.Thread):
                         raise ProtocolError("Cancel transfer ID mismatch")
                     raise TransferCancelled("Transfer cancelled by peer")
                 remaining = offered.size - info.bytes_transferred
-                declared_size = control.get("size")
-                if (
-                    control.get("type") != "chunk"
-                    or control.get("transfer_id") != offer.transfer_id
-                    or control.get("file_id") != offered.file_id
-                    or control.get("index") != index
-                    or control.get("offset") != info.bytes_transferred
-                    or isinstance(declared_size, bool)
-                    or not isinstance(declared_size, int)
-                    or not 0 < declared_size <= min(CHUNK_SIZE, remaining)
-                ):
-                    raise ProtocolError("Invalid chunk metadata")
+                declared_size = validate_chunk_control(
+                    control,
+                    transfer_id=offer.transfer_id,
+                    file_id=offered.file_id,
+                    expected_index=index,
+                    expected_offset=info.bytes_transferred,
+                    remaining=remaining,
+                )
                 conn.settimeout(CHUNK_TIMEOUT)
                 plaintext = _recv_frame_bytes(conn, session_key)
                 conn.settimeout(IDLE_TRANSFER_TIMEOUT)
@@ -805,14 +687,17 @@ class FileServer(threading.Thread):
             # ── Verify integrity ──
             actual_hash = hasher.hexdigest()
             if actual_hash != expected_hash:
-                info.status = TransferStatus.FAILED
-                info.error = (
-                    f"Hash mismatch: expected {expected_hash[:12]}…, "
-                    f"got {actual_hash[:12]}…"
+                set_status(
+                    info,
+                    TransferStatus.FAILED,
+                    error=(
+                        f"Hash mismatch: expected {expected_hash[:12]}…, "
+                        f"got {actual_hash[:12]}…"
+                    ),
                 )
                 log.error("Hash mismatch for %s from %s", filename, peer_ip)
             else:
-                info.status = TransferStatus.COMPLETE
+                set_status(info, TransferStatus.COMPLETE)
                 log.info(
                     "Received %s from %s (%.2f MB/s, hash OK)",
                     filename,
@@ -821,9 +706,8 @@ class FileServer(threading.Thread):
                 )
 
         except (ConnectionError, OSError, ProtocolError, InvalidTag, ValueError) as e:
-            if info:
-                info.status = TransferStatus.FAILED
-                info.error = str(e)
+            if info and not is_terminal(info.status):
+                set_status(info, TransferStatus.FAILED, error=str(e))
             log.error("Receive failed from %s: %s", peer_ip, e)
 
         finally:
@@ -907,6 +791,12 @@ class FileClient:
         self._transfers: list[TransferInfo] = []
         self._lock = threading.Lock()
         self._cancel_events: dict[str, threading.Event] = {}
+        self._workers: set[threading.Thread] = set()
+        self._sockets: dict[str, socket.socket] = {}
+        self._stopping = threading.Event()
+        self._worker_slots = threading.BoundedSemaphore(
+            MAX_CONCURRENT_TRANSFER_SESSIONS
+        )
 
     # ── Public API ──────────────────────────────────────────────────
 
@@ -932,6 +822,10 @@ class FileClient:
             filepaths: List of file paths to send.
             message: Optional text message (sent in session header).
         """
+        if self._stopping.is_set():
+            raise RuntimeError("Transfer client is shutting down")
+        if not self._worker_slots.acquire(blocking=False):
+            raise RuntimeError("Transfer session limit reached")
         transfer_id = uuid.uuid4().hex
         cancel_event = threading.Event()
         with self._lock:
@@ -942,7 +836,16 @@ class FileClient:
             daemon=True,
             name=f"send-batch-{peer_ip}",
         )
-        thread.start()
+        with self._lock:
+            self._workers.add(thread)
+        try:
+            thread.start()
+        except RuntimeError:
+            with self._lock:
+                self._workers.discard(thread)
+                self._cancel_events.pop(transfer_id, None)
+            self._worker_slots.release()
+            raise
         return transfer_id
 
     def cancel_transfer(self, transfer_id: str) -> bool:
@@ -968,6 +871,34 @@ class FileClient:
         """Return a snapshot of all transfer records."""
         with self._lock:
             return list(self._transfers)
+
+    @property
+    def active_worker_count(self) -> int:
+        """Return the bounded outgoing worker count for diagnostics/tests."""
+        with self._lock:
+            return len(self._workers)
+
+    def shutdown(self) -> None:
+        """Cancel workers, close their sockets, and wait briefly for cleanup."""
+        self._stopping.set()
+        with self._lock:
+            events = tuple(self._cancel_events.values())
+            sockets = tuple(self._sockets.values())
+            workers = tuple(self._workers)
+        for event in events:
+            event.set()
+        for active_socket in sockets:
+            try:
+                active_socket.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            active_socket.close()
+        deadline = time.monotonic() + 1.0
+        for worker in workers:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            worker.join(timeout=remaining)
 
     def _assert_peer_protocol(
         self,
@@ -1015,6 +946,8 @@ class FileClient:
         finally:
             with self._lock:
                 self._cancel_events.pop(transfer_id, None)
+                self._workers.discard(threading.current_thread())
+            self._worker_slots.release()
 
     def _batch_worker(
         self,
@@ -1095,7 +1028,8 @@ class FileClient:
                     return
                 for info in infos:
                     info.retry_count = attempt
-                    info.status = TransferStatus.RESUMING
+                    if not is_terminal(info.status):
+                        set_status(info, TransferStatus.RESUMING)
 
             try:
                 self._send_session(
@@ -1111,16 +1045,22 @@ class FileClient:
             except TransferRejected as error:
                 log.info("Transfer rejected by %s: %s", peer_ip, error)
                 for info in infos:
-                    info.status = TransferStatus.REJECTED
-                    info.error = "Transfer rejected by peer."
-                    info.completed_at = time.time()
+                    if not is_terminal(info.status):
+                        set_status(
+                            info,
+                            TransferStatus.REJECTED,
+                            error="Transfer rejected by peer.",
+                        )
                 self._notify()
                 return
             except ApprovalTimeout:
                 for info in infos:
-                    info.status = TransferStatus.FAILED
-                    info.error = "Peer did not respond to transfer request."
-                    info.completed_at = time.time()
+                    if not is_terminal(info.status):
+                        set_status(
+                            info,
+                            TransferStatus.FAILED,
+                            error="Peer did not respond to transfer request.",
+                        )
                 self._notify()
                 return
             except TransferCancelled:
@@ -1129,26 +1069,30 @@ class FileClient:
             except (AuthenticationError, ProtocolError) as e:
                 log.warning("Transfer authentication failed for %s: %s", peer_ip, e)
                 for info in infos:
-                    info.status = TransferStatus.FAILED
-                    info.error = "Transfer rejected."
-                    info.completed_at = time.time()
+                    if not is_terminal(info.status):
+                        set_status(
+                            info,
+                            TransferStatus.FAILED,
+                            error="Transfer rejected.",
+                        )
                 self._notify()
                 return
             except (OSError, ConnectionError) as e:
                 log.warning("Batch send attempt %d failed: %s", attempt + 1, e)
                 for info in infos:
-                    info.status = (
+                    if is_terminal(info.status):
+                        continue
+                    next_status = (
                         TransferStatus.FAILED
                         if attempt == MAX_RETRIES
                         else TransferStatus.INTERRUPTED
                     )
-                    info.error = (
+                    failure = (
                         "Unable to connect to peer."
                         if attempt == MAX_RETRIES
                         else "Connection interrupted"
                     )
-                    if attempt == MAX_RETRIES:
-                        info.completed_at = time.time()
+                    set_status(info, next_status, error=failure)
                 self._notify()
                 if attempt == MAX_RETRIES:
                     log.error(
@@ -1180,6 +1124,8 @@ class FileClient:
             socket.SOCK_STREAM,
         )
         sock.settimeout(CONNECT_TIMEOUT)
+        with self._lock:
+            self._sockets[transfer_id] = sock
 
         try:
             sock.connect((peer_ip, self._port))
@@ -1226,7 +1172,8 @@ class FileClient:
                         raise ApprovalTimeout(reason)
                     raise TransferRejected(reason or "Rejected by user")
                 for info in infos:
-                    info.status = TransferStatus.ACCEPTED
+                    if info.status == TransferStatus.PENDING_APPROVAL:
+                        set_status(info, TransferStatus.ACCEPTED)
                 self._notify()
                 sock.settimeout(IDLE_TRANSFER_TIMEOUT)
                 self._send_v3_payload(
@@ -1251,7 +1198,7 @@ class FileClient:
 
             # ── Send each file ──
             for (path, size, sha), info in zip(file_meta, infos):
-                info.status = TransferStatus.ACTIVE
+                set_status(info, TransferStatus.ACTIVE)
                 info.started_at = time.time()
                 self._notify()
 
@@ -1284,8 +1231,7 @@ class FileClient:
                                 log.exception("Transfer progress callback failed")
                         self._notify()
 
-                info.status = TransferStatus.COMPLETE
-                info.completed_at = time.time()
+                set_status(info, TransferStatus.COMPLETE)
                 log.info(
                     "Sent %s to %s (%.2f MB/s)", path.name, peer_ip, info.speed_mbps
                 )
@@ -1295,6 +1241,8 @@ class FileClient:
             _send_frame(sock, session_key, {"type": "fin"})
 
         finally:
+            with self._lock:
+                self._sockets.pop(transfer_id, None)
             sock.close()
 
     def _wait_for_approval(
@@ -1358,7 +1306,13 @@ class FileClient:
             info.resume_offset = offset
             info.bytes_transferred = offset
             info.bytes_transferred_this_attempt = 0
-            info.status = TransferStatus.RESUMING if offset else TransferStatus.ACTIVE
+            if not is_terminal(info.status):
+                set_status(
+                    info,
+                    TransferStatus.RESUMING if offset else TransferStatus.ACTIVE,
+                )
+                if info.status == TransferStatus.RESUMING:
+                    set_status(info, TransferStatus.ACTIVE)
             self._notify()
             _send_frame(
                 sock,
@@ -1417,8 +1371,7 @@ class FileClient:
                 or result.get("ok") is not True
             ):
                 raise ProtocolError("Receiver failed file verification")
-            info.status = TransferStatus.COMPLETE
-            info.completed_at = time.time()
+            set_status(info, TransferStatus.COMPLETE)
             self._notify()
 
         _send_frame(
@@ -1443,10 +1396,8 @@ class FileClient:
 
     def _mark_cancelled(self, infos: list[TransferInfo]) -> None:
         for info in infos:
-            if info.status != TransferStatus.COMPLETE:
-                info.status = TransferStatus.CANCELLED
-                info.error = "Cancelled by user"
-                info.completed_at = time.time()
+            if not is_terminal(info.status):
+                set_status(info, TransferStatus.CANCELLED, error="Cancelled by user")
         self._notify()
 
     def _peer_device_id(self, peer_ip: str) -> str | None:
@@ -1505,6 +1456,7 @@ class SecureTransfer:
         on_file_received: Callable[[TransferInfo], None] | None = None,
         on_progress: Callable[[str, int, int], None] | None = None,
         on_incoming_request: Callable[[IncomingTransferRequest], None] | None = None,
+        on_event: Callable[[TransferEvent], None] | None = None,
         history_store: TransferHistoryStore | None = None,
         identity: DeviceIdentity | None = None,
         trust_store: TrustStore | None = None,
@@ -1519,6 +1471,10 @@ class SecureTransfer:
         self._history_lock = threading.RLock()
         self._persisted_progress: dict[str, tuple[float, int, str]] = {}
         self._peer_resolver = peer_resolver
+        self.events = EventPublisher()
+        if on_event is not None:
+            self.events.subscribe(on_event)
+        self._terminal_events: set[tuple[str, str]] = set()
         self._incoming = IncomingRequestManager(
             self._handle_incoming_request,
             self._handle_request_decision,
@@ -1557,8 +1513,9 @@ class SecureTransfer:
         log.info("Transfer server started on port %d", self._port)
 
     def stop_server(self) -> None:
-        """Stop the TCP server."""
+        """Stop accepting, cancel outgoing workers, and close active sockets."""
         self._server.shutdown()
+        self._client.shutdown()
         log.info("Transfer server stopped")
 
     def send_file(
@@ -1637,6 +1594,7 @@ class SecureTransfer:
                     for item in request.files
                 ],
             )
+        self.events.publish(IncomingTransferOffered(request))
         if self._on_incoming_request is not None:
             self._on_incoming_request(request)
 
@@ -1679,6 +1637,22 @@ class SecureTransfer:
         if self._history is not None:
             with self._history_lock:
                 self._persist_runtime_transfers()
+        transfers = tuple(self.get_transfers())
+        self.events.publish(TransferUpdated(transfers))
+        for info in transfers:
+            key = (info.transfer_id, info.file_id or info.filename)
+            if key in self._terminal_events:
+                continue
+            if info.status == TransferStatus.COMPLETE:
+                self._terminal_events.add(key)
+                self.events.publish(TransferCompleted(info))
+            elif info.status in {
+                TransferStatus.FAILED,
+                TransferStatus.REJECTED,
+                TransferStatus.CANCELLED,
+            }:
+                self._terminal_events.add(key)
+                self.events.publish(TransferFailed(info))
         if self._on_update is not None:
             self._on_update()
 
@@ -1754,12 +1728,7 @@ class SecureTransfer:
         grouped: dict[str, list[TransferInfo]] = {}
         for info in self.get_transfers():
             grouped.setdefault(info.transfer_id, []).append(info)
-        terminal = {
-            TransferStatus.COMPLETE,
-            TransferStatus.FAILED,
-            TransferStatus.REJECTED,
-            TransferStatus.CANCELLED,
-        }
+        terminal = TERMINAL_TRANSFER_STATUSES
         now = time.monotonic()
         for transfer_id, raw_infos in grouped.items():
             # Deduplicate by logical file: (transfer_id + file_id/filename + direction)

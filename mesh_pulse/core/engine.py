@@ -24,6 +24,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from mesh_pulse.core.composition import build_services
 from mesh_pulse.core.discovery import PeerDiscovery, PeerManager
 from mesh_pulse.core.history import TransferHistoryStore
 from mesh_pulse.core.identity import DeviceIdentity
@@ -72,28 +73,18 @@ def start_engine(
     Returns:
         EngineHandles with references to all running subsystems.
     """
-    identity = DeviceIdentity.load_or_create(identity_directory)
-    trust_store = TrustStore(identity.directory / "trusted_devices.json")
-    history_store = TransferHistoryStore(identity.directory / "history.db")
-    peer_manager = PeerManager(trust_store=trust_store)
-    monitor = SystemMonitor()
-
-    discovery = PeerDiscovery(
-        port=broadcast_port,
+    services = build_services(
+        broadcast_port=broadcast_port,
         transfer_port=transfer_port,
-        local_metrics_fn=lambda: monitor.latest.to_broadcast_dict(),
-        peer_manager=peer_manager,
-        identity=identity,
+        identity_directory=identity_directory,
     )
-
-    transfer = SecureTransfer(
-        transfer_port=transfer_port,
-        identity=identity,
-        trust_store=trust_store,
-        peer_resolver=peer_manager.get_peer,
-        legacy_mode=False,
-        history_store=history_store,
-    )
+    identity = services.identity
+    trust_store = services.trust_store
+    history_store = services.history_store
+    peer_manager = services.peer_manager
+    monitor = services.monitor
+    discovery = services.broadcaster.discovery
+    transfer = services.transfer
     file_server = transfer.file_server
     file_client = transfer.file_client
 
@@ -128,8 +119,8 @@ def stop_engine(handles: EngineHandles) -> None:
     Args:
         handles: EngineHandles returned by start_engine().
     """
+    handles.transfer.stop_server()
     handles.discovery.shutdown()
-    handles.file_server.shutdown()
     handles.monitor.stop()
     log.info("All engine subsystems stopped")
 

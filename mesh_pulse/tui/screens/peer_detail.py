@@ -13,6 +13,7 @@ from textual.screen import Screen
 from textual.widgets import Static
 
 from mesh_pulse.core.discovery import Peer, PeerManager, PeerStatus
+from mesh_pulse.core.network_intelligence import peer_health
 from mesh_pulse.core.transfer import SecureTransfer
 from mesh_pulse.core.trust import TrustStatus, TrustStore
 from mesh_pulse.tui.modals.pairing import PairingModal
@@ -37,9 +38,20 @@ def format_peer_detail(peer: Peer, *, online: bool = True) -> Table:
     grid.add_row("IP", peer.ip)
     grid.add_row("Port", str(peer.port))
     grid.add_row("Status", status)
+    grid.add_row("Quality", peer_health(peer))
     grid.add_row("Trust", trust)
     grid.add_row("Fingerprint", peer.fingerprint or "Unavailable")
     grid.add_row("Latency", latency)
+    grid.add_row(
+        "Latency updated",
+        time.strftime("%H:%M:%S", time.localtime(peer.latency_updated_at))
+        if peer.latency_updated_at
+        else "Unavailable",
+    )
+    grid.add_row(
+        "Transfer security",
+        "Authenticated v3" if peer.protocol_version == 3 else "Legacy v2",
+    )
     grid.add_row("CPU", f"{metrics.cpu_percent:.1f}%")
     grid.add_row("RAM", f"{metrics.ram_percent:.1f}%")
     grid.add_row("Network sent", str(metrics.net_sent_bytes))
@@ -48,6 +60,11 @@ def format_peer_detail(peer: Peer, *, online: bool = True) -> Table:
     grid.add_row("Disk written", str(metrics.disk_write_bytes))
     grid.add_row("First seen", first_seen)
     grid.add_row("Last seen", last_seen)
+    grid.add_row("Beacons seen", str(peer.seen_count))
+    grid.add_row(
+        "Recent transfers",
+        f"{peer.successful_transfers} successful · {peer.failed_transfers} failed",
+    )
     return grid
 
 
@@ -125,7 +142,7 @@ class PeerDetailScreen(Screen):
 
     def refresh_peer(self) -> None:
         peer = self._pm.get_peer(self._peer_id)
-        online = peer is not None and peer.status == PeerStatus.ONLINE
+        present = peer is not None
         if peer is not None:
             self._last_peer = peer
 
@@ -140,12 +157,17 @@ class PeerDetailScreen(Screen):
             )
         elif peer.status == PeerStatus.STALE:
             offline.update("Peer heartbeat is stale; availability may be limited.")
+        elif peer.status == PeerStatus.OFFLINE:
+            offline.update(
+                "Peer is offline. "
+                f"Last seen {PeerListWidget.format_last_seen(peer.age)}."
+            )
         else:
             offline.update("")
 
         self.query_one("#peer-detail-title", Static).update(self._last_peer.hostname)
         self.query_one("#peer-detail-data", Static).update(
-            format_peer_detail(self._last_peer, online=online)
+            format_peer_detail(self._last_peer, online=present)
         )
         self._refresh_footer()
 

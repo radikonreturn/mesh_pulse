@@ -58,10 +58,10 @@ class TransferHistoryStore:
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self.available = True
         try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
             self._migrate()
         except (OSError, sqlite3.DatabaseError) as error:
             self.available = False

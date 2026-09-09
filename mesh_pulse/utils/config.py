@@ -59,14 +59,50 @@ def _get(key: str, env_var: str, default):
     return default
 
 
+def validate_port(value: object, name: str) -> int:
+    """Reject bools and out-of-range ports at the configuration boundary."""
+    if isinstance(value, bool):
+        raise TypeError(f"{name} must be an integer port")
+    try:
+        port = int(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{name} must be an integer port") from error
+    if not 1 <= port <= 65535:
+        raise ValueError(f"{name} must be between 1 and 65535")
+    return port
+
+
+def validate_timeout(value: object, name: str) -> float:
+    """Reject non-positive or absurd timeout values."""
+    if isinstance(value, bool):
+        raise TypeError(f"{name} must be a positive timeout")
+    try:
+        timeout = float(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{name} must be a positive timeout") from error
+    if not 0 < timeout <= 3600:
+        raise ValueError(f"{name} must be between 0 and 3600 seconds")
+    return timeout
+
+
 # ─── Network ────────────────────────────────────────────────────────
-BROADCAST_PORT: int = _get("broadcast_port", "MESH_PULSE_BCAST_PORT", 37020)
-TRANSFER_PORT: int = _get("transfer_port", "MESH_PULSE_XFER_PORT", 5000)
+BROADCAST_PORT: int = validate_port(
+    _get("broadcast_port", "MESH_PULSE_BCAST_PORT", 37020), "broadcast_port"
+)
+TRANSFER_PORT: int = validate_port(
+    _get("transfer_port", "MESH_PULSE_XFER_PORT", 5000), "transfer_port"
+)
 BROADCAST_ADDR = "255.255.255.255"
 BROADCAST_INTERVAL = 2  # seconds between heartbeats
 PEER_STALE_TIMEOUT = 6  # seconds before marking peer stale
-PEER_DEAD_TIMEOUT = 10  # seconds before removing peer
+PEER_DEAD_TIMEOUT = 30  # seconds before marking peer offline
+PEER_FORGET_TIMEOUT = 300  # seconds before removing an offline peer
 PEER_TIMEOUT = 10  # auto-remove unseen peers after N seconds
+DISCOVERY_MAX_AGE = 30
+DISCOVERY_FUTURE_SKEW = 5
+MAX_DISCOVERED_PEERS = 1024
+MAX_REPLAY_DEVICES = 1024
+MAX_REPLAY_NONCES_PER_DEVICE = 32
 
 # ─── Transfer ───────────────────────────────────────────────────────
 CHUNK_SIZE = 64 * 1024  # 64 KB per encrypted chunk
@@ -77,11 +113,13 @@ MAX_FILE_SIZE = 100 * 1024 * 1024 * 1024  # 100 GiB
 MAX_SESSION_SIZE = 1024 * 1024 * 1024 * 1024  # 1 TiB
 MAX_RETRIES = 3  # max send retry attempts
 RETRY_DELAYS = (1.0, 2.0, 4.0)  # bounded exponential retry backoff
-CONNECT_TIMEOUT = 10
-HANDSHAKE_TIMEOUT = 10
-TRANSFER_APPROVAL_TIMEOUT = 120
-CHUNK_TIMEOUT = 30
-IDLE_TRANSFER_TIMEOUT = 60
+MAX_CONCURRENT_TRANSFER_SESSIONS = 8
+MAX_PENDING_TRANSFER_REQUESTS = 32
+CONNECT_TIMEOUT = validate_timeout(10, "connect_timeout")
+HANDSHAKE_TIMEOUT = validate_timeout(10, "handshake_timeout")
+TRANSFER_APPROVAL_TIMEOUT = validate_timeout(120, "approval_timeout")
+CHUNK_TIMEOUT = validate_timeout(30, "chunk_timeout")
+IDLE_TRANSFER_TIMEOUT = validate_timeout(60, "idle_transfer_timeout")
 
 # ─── Monitoring ─────────────────────────────────────────────────────
 MONITOR_INTERVAL = 2  # seconds between metric snapshots

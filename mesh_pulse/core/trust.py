@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import tempfile
 import threading
@@ -63,20 +64,55 @@ class TrustStore:
             return
         try:
             payload = json.loads(self.path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                raise TypeError("trust store must be an object")
             devices = payload.get("devices", {})
             if not isinstance(devices, dict):
                 raise TypeError("devices must be an object")
-            loaded: dict[str, TrustedDevice] = {}
-            for device_id, record in devices.items():
-                if not isinstance(record, dict) or record.get("device_id") != device_id:
-                    continue
-                candidate = TrustedDevice(**record)
-                self._validate(candidate.device_id, candidate.public_key)
-                loaded[device_id] = candidate
-            self._devices = loaded
-        except (OSError, ValueError, TypeError, json.JSONDecodeError) as error:
+        except (OSError, TypeError, json.JSONDecodeError) as error:
             log.warning("Ignoring invalid trust store %s: %s", self.path, error)
             self._devices = {}
+            return
+
+        loaded: dict[str, TrustedDevice] = {}
+        for device_id, record in devices.items():
+            try:
+                if not isinstance(record, dict) or record.get("device_id") != device_id:
+                    raise ValueError("record key does not match device ID")
+                candidate = TrustedDevice(**record)
+                self._validate_record(candidate)
+            except (TypeError, ValueError) as error:
+                safe_id = str(device_id)[:24]
+                log.warning("Skipping invalid trust record %s: %s", safe_id, error)
+                continue
+            loaded[device_id] = candidate
+        self._devices = loaded
+
+    @classmethod
+    def _validate_record(cls, candidate: TrustedDevice) -> None:
+        cls._validate(candidate.device_id, candidate.public_key)
+        if (
+            not isinstance(candidate.hostname, str)
+            or not candidate.hostname
+            or len(candidate.hostname) > 255
+            or not candidate.hostname.isprintable()
+        ):
+            raise ValueError("Invalid trusted hostname")
+        if candidate.status not in {
+            TrustStatus.TRUSTED.value,
+            TrustStatus.REJECTED.value,
+        }:
+            raise ValueError("Invalid trust status")
+        if candidate.fingerprint != fingerprint_from_public_key(candidate.public_key):
+            raise ValueError("Invalid identity fingerprint")
+        for value in (candidate.first_trusted_at, candidate.last_seen_at):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or value < 0
+            ):
+                raise ValueError("Invalid trust timestamp")
 
     @staticmethod
     def _validate(device_id: str, public_key: str) -> None:

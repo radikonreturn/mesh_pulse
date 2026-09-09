@@ -37,7 +37,8 @@ class PeerDetailModal(ModalScreen):
     }
 
     #detail-box {
-        width: 64;
+        width: 80%;
+        max-width: 72;
         height: auto;
         background: #0d1117;
         border: thick #0ea5e9;
@@ -131,11 +132,11 @@ class PeerDetailModal(ModalScreen):
         grid.add_row("Last Seen", last_seen)
 
         with Vertical(id="detail-box"):
-            yield Static(f"🔍 Peer: {p.hostname}", id="detail-title")
+            yield Static(f"Peer: {p.hostname}", id="detail-title")
             yield Static(grid, id="detail-table")
             with Horizontal(id="detail-btn-row"):
-                yield Button("📤 Send File", variant="success", id="send-to-btn")
-                yield Button("✗ Close", variant="error", id="close-btn")
+                yield Button("Send File", variant="success", id="send-to-btn")
+                yield Button("Close", variant="error", id="close-btn")
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "send-to-btn":

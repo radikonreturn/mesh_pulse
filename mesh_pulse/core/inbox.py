@@ -8,6 +8,12 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from enum import Enum
 
+from mesh_pulse.utils.config import MAX_PENDING_TRANSFER_REQUESTS
+
+
+class InboxCapacityError(RuntimeError):
+    """The bounded incoming approval queue is full."""
+
 
 class IncomingRequestStatus(Enum):
     """Lifecycle of an authenticated incoming transfer offer."""
@@ -58,11 +64,15 @@ class IncomingRequestManager:
         self,
         on_request: Callable[[IncomingTransferRequest], None] | None = None,
         on_decision: Callable[[IncomingTransferRequest], None] | None = None,
+        max_pending: int = MAX_PENDING_TRANSFER_REQUESTS,
     ) -> None:
         self._entries: dict[str, _PendingDecision] = {}
         self._lock = threading.RLock()
         self._on_request = on_request
         self._on_decision = on_decision
+        if max_pending <= 0:
+            raise ValueError("max_pending must be positive")
+        self._max_pending = max_pending
 
     def publish(self, request: IncomingTransferRequest) -> None:
         """Publish a newly authenticated request without exposing mutable state."""
@@ -87,6 +97,12 @@ class IncomingRequestManager:
                     )
                     return
                 raise ValueError("Transfer request already exists")
+            pending_count = sum(
+                entry.request.status == IncomingRequestStatus.PENDING_APPROVAL
+                for entry in self._entries.values()
+            )
+            if pending_count >= self._max_pending:
+                raise InboxCapacityError("Incoming transfer inbox is full")
             self._entries[request.transfer_id] = _PendingDecision(
                 request=request,
                 event=threading.Event(),
@@ -152,6 +168,17 @@ class IncomingRequestManager:
                 if entry.request.status == IncomingRequestStatus.PENDING_APPROVAL
                 or entry.request.received_at >= cutoff
             }
+
+    def cancel_all(self, reason: str = "Receiver is shutting down") -> None:
+        """Wake all pending session workers during service shutdown."""
+        with self._lock:
+            pending_ids = [
+                transfer_id
+                for transfer_id, entry in self._entries.items()
+                if entry.request.status == IncomingRequestStatus.PENDING_APPROVAL
+            ]
+        for transfer_id in pending_ids:
+            self.cancel_request(transfer_id, reason)
 
     def _decide(
         self,

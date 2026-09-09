@@ -140,7 +140,11 @@ class PeerListWidget(Vertical):
 
     @staticmethod
     def _status_text(peer: Peer) -> str:
-        return "●" if peer.status == PeerStatus.ONLINE else "○"
+        if peer.status == PeerStatus.ONLINE:
+            return "●"
+        if peer.status == PeerStatus.STALE:
+            return "◐"
+        return "○"
 
     @staticmethod
     def _trust_text(peer: Peer) -> str:
@@ -151,7 +155,7 @@ class PeerListWidget(Vertical):
     @staticmethod
     def format_latency(ms: float | None) -> str:
         """Format a measured TCP latency for compact table display."""
-        return "probing…" if ms is None else f"{ms:.0f} ms"
+        return "—" if ms is None else f"{ms:.0f} ms"
 
     @staticmethod
     def format_last_seen(age: float) -> str:

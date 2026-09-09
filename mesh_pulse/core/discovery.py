@@ -6,7 +6,7 @@ Architecture:
     - LatencyProber: background TCP-connect latency measurement per peer
     - UDPBroadcaster: facade wrapping PeerDiscovery (used by app.py)
 
-Peers auto-transition: ONLINE → STALE → removed, based on heartbeat age.
+Peers auto-transition: ONLINE → STALE → OFFLINE → forgotten, based on heartbeat age.
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ import base64
 import json
 import math
 import re
+import secrets
 import socket
 import threading
 import time
@@ -30,15 +31,22 @@ from mesh_pulse.core.identity import (
     device_id_from_public_key,
     fingerprint_from_public_key,
 )
+from mesh_pulse.core.network_intelligence import NetworkOverview, summarize_network
+from mesh_pulse.core.network_interfaces import discovery_broadcast_targets
 from mesh_pulse.core.trust import TrustStatus, TrustStore
 from mesh_pulse.utils.config import (
-    BROADCAST_ADDR,
     BROADCAST_INTERVAL,
     BROADCAST_PORT,
+    DISCOVERY_FUTURE_SKEW,
+    DISCOVERY_MAX_AGE,
     HOSTNAME,
     LATENCY_PROBE_INTERVAL,
     LOCAL_IP,
+    MAX_DISCOVERED_PEERS,
+    MAX_REPLAY_DEVICES,
+    MAX_REPLAY_NONCES_PER_DEVICE,
     PEER_DEAD_TIMEOUT,
+    PEER_FORGET_TIMEOUT,
     PEER_STALE_TIMEOUT,
     PEER_TIMEOUT,
     TRANSFER_PORT,
@@ -51,6 +59,7 @@ DISCOVERY_PROTOCOL = 3
 MAX_BEACON_SIZE = 4096
 MAX_HOSTNAME_LENGTH = 255
 _DEVICE_ID_PATTERN = re.compile(r"^mp-[0-9a-f]{8}$")
+_NONCE_PATTERN = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 _METRIC_FIELDS = {
     "cpu_percent",
     "ram_percent",
@@ -71,6 +80,7 @@ class PeerStatus(Enum):
 
     ONLINE = "online"
     STALE = "stale"
+    OFFLINE = "offline"
 
 
 @dataclass
@@ -102,6 +112,14 @@ class Peer:
     fingerprint: str | None = None
     trust_status: TrustStatus = TrustStatus.NEW
     protocol_version: int = 2
+    first_seen_monotonic: float = field(default_factory=time.monotonic, repr=False)
+    last_seen_monotonic: float = field(default_factory=time.monotonic, repr=False)
+    seen_count: int = 1
+    latency_updated_at: float | None = None
+    connection_failures: int = 0
+    successful_transfers: int = 0
+    failed_transfers: int = 0
+    last_transfer_at: float | None = None
 
     @property
     def stable_id(self) -> str:
@@ -111,7 +129,7 @@ class Peer:
     @property
     def age(self) -> float:
         """Seconds since last heartbeat."""
-        return time.time() - self.last_seen
+        return max(0.0, time.monotonic() - self.last_seen_monotonic)
 
     def to_dict(self) -> dict:
         return {
@@ -127,7 +145,61 @@ class Peer:
             "fingerprint": self.fingerprint,
             "trust_status": self.trust_status.value,
             "protocol_version": self.protocol_version,
+            "seen_count": self.seen_count,
+            "latency_updated_at": self.latency_updated_at,
+            "connection_failures": self.connection_failures,
+            "successful_transfers": self.successful_transfers,
+            "failed_transfers": self.failed_transfers,
+            "last_transfer_at": self.last_transfer_at,
         }
+
+
+class DiscoveryReplayCache:
+    """Bounded in-memory cache of recently authenticated beacon nonces."""
+
+    def __init__(
+        self,
+        *,
+        max_devices: int = MAX_REPLAY_DEVICES,
+        max_per_device: int = MAX_REPLAY_NONCES_PER_DEVICE,
+        ttl: float = DISCOVERY_MAX_AGE + DISCOVERY_FUTURE_SKEW,
+    ):
+        self._max_devices = max(1, max_devices)
+        self._max_per_device = max(1, max_per_device)
+        self._ttl = max(1.0, ttl)
+        self._entries: dict[str, dict[str, float]] = {}
+        self._lock = threading.Lock()
+
+    def check_and_add(self, device_id: str, nonce: str, *, now: float) -> bool:
+        """Return false for an exact live replay; otherwise remember the nonce."""
+        with self._lock:
+            cutoff = now - self._ttl
+            for known_device in list(self._entries):
+                recent = self._entries[known_device]
+                self._entries[known_device] = {
+                    value: seen for value, seen in recent.items() if seen >= cutoff
+                }
+                if not self._entries[known_device]:
+                    del self._entries[known_device]
+            recent = self._entries.setdefault(device_id, {})
+            if nonce in recent:
+                return False
+            recent[nonce] = now
+            while len(recent) > self._max_per_device:
+                oldest = min(recent, key=recent.get)
+                del recent[oldest]
+            while len(self._entries) > self._max_devices:
+                oldest_device = min(
+                    self._entries,
+                    key=lambda key: max(self._entries[key].values()),
+                )
+                del self._entries[oldest_device]
+            return True
+
+    @property
+    def size(self) -> int:
+        with self._lock:
+            return sum(len(values) for values in self._entries.values())
 
 
 def _validated_metrics(metrics: object) -> dict:
@@ -224,7 +296,7 @@ def build_discovery_beacon(
             "hostname": hostname,
             "ip": advertised_ip,
             "port": port,
-            "timestamp": timestamp or time.time(),
+            "timestamp": time.time() if timestamp is None else timestamp,
         }
     else:
         payload = {
@@ -233,7 +305,8 @@ def build_discovery_beacon(
             "hostname": hostname,
             "ip": advertised_ip,
             "port": port,
-            "timestamp": timestamp or time.time(),
+            "timestamp": time.time() if timestamp is None else timestamp,
+            "nonce": secrets.token_urlsafe(12),
             "device_id": identity.device_id,
             "public_key": identity.public_key,
         }
@@ -257,6 +330,9 @@ def parse_discovery_beacon(
     data: bytes,
     source_ip: str,
     default_port: int = TRANSFER_PORT,
+    *,
+    now: float | None = None,
+    replay_cache: DiscoveryReplayCache | None = None,
 ) -> dict | None:
     """Validate an incoming discovery advertisement.
 
@@ -270,7 +346,7 @@ def parse_discovery_beacon(
 
     try:
         payload = json.loads(data.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
         return None
 
     if not isinstance(payload, dict):
@@ -319,13 +395,27 @@ def parse_discovery_beacon(
     transfer_protocol = 2
 
     if protocol == DISCOVERY_PROTOCOL:
+        if "timestamp" not in payload:
+            return None
         device_id = payload.get("device_id")
         public_key = payload.get("public_key")
+        nonce = payload.get("nonce")
 
         if (
             not isinstance(device_id, str)
             or not _DEVICE_ID_PATTERN.fullmatch(device_id)
             or not isinstance(public_key, str)
+            or len(public_key) > 128
+            or not isinstance(nonce, str)
+            or not _NONCE_PATTERN.fullmatch(nonce)
+        ):
+            return None
+
+        received_at = time.time() if now is None else now
+        beacon_time = float(timestamp)
+        if (
+            beacon_time < received_at - DISCOVERY_MAX_AGE
+            or beacon_time > received_at + DISCOVERY_FUTURE_SKEW
         ):
             return None
 
@@ -343,6 +433,11 @@ def parse_discovery_beacon(
         if not _verify_discovery_signature(
             payload,
             public_key,
+        ):
+            return None
+
+        if replay_cache is not None and not replay_cache.check_and_add(
+            device_id, nonce, now=received_at
         ):
             return None
 
@@ -395,16 +490,15 @@ class LatencyProber(threading.Thread):
     def __init__(self, peer_manager: PeerManager):
         super().__init__(daemon=True, name="latency-prober")
         self._pm = peer_manager
-        self._running = threading.Event()
-        self._running.set()
+        self._stop_event = threading.Event()
 
     def run(self) -> None:
-        while self._running.is_set():
+        while not self._stop_event.is_set():
             self._probe_all()
-            self._running.wait(LATENCY_PROBE_INTERVAL)
+            self._stop_event.wait(LATENCY_PROBE_INTERVAL)
 
     def shutdown(self) -> None:
-        self._running.clear()
+        self._stop_event.set()
 
     def _probe_all(self) -> None:
         for peer in self._pm.get_peers():
@@ -431,20 +525,33 @@ class LatencyProber(threading.Thread):
 class PeerManager:
     """Thread-safe registry of discovered peers with timeout management.
 
-    Peers transition: ONLINE → STALE → removed, based on heartbeat age.
+    Peers transition: ONLINE → STALE → OFFLINE → forgotten by heartbeat age.
     """
 
     def __init__(
         self,
         stale_timeout: float = PEER_STALE_TIMEOUT,
-        dead_timeout: float = PEER_DEAD_TIMEOUT,
+        dead_timeout: float | None = None,
         on_peer_change: Callable | None = None,
         trust_store: TrustStore | None = None,
+        *,
+        forget_timeout: float | None = None,
+        max_peers: int = MAX_DISCOVERED_PEERS,
     ):
         self._peers: dict[str, Peer] = {}
         self._lock = threading.Lock()
         self._stale_timeout = stale_timeout
-        self._dead_timeout = dead_timeout
+        self._dead_timeout = PEER_DEAD_TIMEOUT if dead_timeout is None else dead_timeout
+        self._forget_timeout = (
+            PEER_FORGET_TIMEOUT
+            if forget_timeout is None and dead_timeout is None
+            else self._dead_timeout
+            if forget_timeout is None
+            else forget_timeout
+        )
+        if not 0 < stale_timeout < self._dead_timeout <= self._forget_timeout:
+            raise ValueError("Peer timeouts must satisfy stale < offline <= forget")
+        self._max_peers = max(1, max_peers)
         self._on_peer_change = on_peer_change
         self._trust_store = trust_store
 
@@ -487,6 +594,8 @@ class PeerManager:
             if existing_key in self._peers:
                 peer = self._peers[existing_key]
                 peer.last_seen = time.time()
+                peer.last_seen_monotonic = time.monotonic()
+                peer.seen_count += 1
                 peer.status = PeerStatus.ONLINE
                 peer.hostname = hostname
                 peer.ip = ip
@@ -502,6 +611,9 @@ class PeerManager:
                     del self._peers[existing_key]
                     self._peers[ip] = peer
             else:
+                if len(self._peers) >= self._max_peers:
+                    log.warning("Peer registry capacity reached; ignoring %s", ip)
+                    return
                 peer = Peer(
                     hostname=hostname,
                     ip=ip,
@@ -525,15 +637,19 @@ class PeerManager:
 
     def sweep(self) -> None:
         """Mark stale peers and remove dead ones."""
-        now = time.time()
+        now = time.monotonic()
         changed = False
         with self._lock:
             dead_ips = []
             for ip, peer in self._peers.items():
-                age = now - peer.last_seen
-                if age > self._dead_timeout:
+                age = now - peer.last_seen_monotonic
+                if age > self._forget_timeout:
                     dead_ips.append(ip)
                     changed = True
+                elif age > self._dead_timeout and peer.status != PeerStatus.OFFLINE:
+                    peer.status = PeerStatus.OFFLINE
+                    changed = True
+                    log.info("Peer offline: %s (%s)", peer.hostname, ip)
                 elif age > self._stale_timeout and peer.status == PeerStatus.ONLINE:
                     peer.status = PeerStatus.STALE
                     changed = True
@@ -594,7 +710,40 @@ class PeerManager:
                 None,
             )
             if peer is not None:
-                peer.latency_ms = latency_ms
+                if latency_ms is None:
+                    peer.latency_ms = None
+                    peer.latency_updated_at = time.time()
+                elif (
+                    not isinstance(latency_ms, bool)
+                    and isinstance(latency_ms, (int, float))
+                    and math.isfinite(float(latency_ms))
+                    and 0 <= latency_ms <= 60_000
+                ):
+                    peer.latency_ms = float(latency_ms)
+                    peer.latency_updated_at = time.time()
+
+    def record_transfer_result(self, identifier: str, *, success: bool) -> None:
+        """Record a bounded runtime transfer outcome for explainable health."""
+        with self._lock:
+            peer = next(
+                (
+                    candidate
+                    for key, candidate in self._peers.items()
+                    if key == identifier or candidate.stable_id == identifier
+                ),
+                None,
+            )
+            if peer is None:
+                return
+            if success:
+                peer.successful_transfers += 1
+            else:
+                peer.failed_transfers += 1
+                peer.connection_failures += 1
+            peer.last_transfer_at = time.time()
+
+    def network_overview(self, *, active_transfers: int = 0) -> NetworkOverview:
+        return summarize_network(self.get_peers(), active_transfers=active_transfers)
 
     def refresh_trust(self, identifier: str) -> TrustStatus | None:
         """Re-assess a peer after an explicit local trust-store change."""
@@ -666,6 +815,12 @@ class PeerDiscovery(threading.Thread):
         self._transfer_protocol = transfer_protocol
         self._running = threading.Event()
         self._running.set()
+        self._stop_event = threading.Event()
+        self._replay_cache = DiscoveryReplayCache()
+        self._broadcast_targets = discovery_broadcast_targets()
+        self._listener: threading.Thread | None = None
+        self._send_socket: socket.socket | None = None
+        self._listen_socket: socket.socket | None = None
 
         # Shared dict: {IP: LastSeenTimestamp}
         self.peers: dict[str, float] = {}
@@ -684,30 +839,49 @@ class PeerDiscovery(threading.Thread):
         listener = threading.Thread(
             target=self._listen_loop, daemon=True, name="udp-listen"
         )
+        self._listener = listener
         listener.start()
 
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._send_socket = sock
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         sock.settimeout(1.0)
 
         while self._running.is_set():
             try:
                 beacon = self._build_beacon()
-                sock.sendto(beacon, (BROADCAST_ADDR, self._port))
+                for target in self._broadcast_targets:
+                    sock.sendto(beacon, (target, self._port))
             except (OSError, ValueError) as e:
                 log.debug("Broadcast send error: %s", e)
 
             self._sweep_peers()
-            self._running.wait(self._interval)
+            self._stop_event.wait(self._interval)
 
-        sock.close()
+        try:
+            sock.close()
+        except OSError:
+            pass
+        self._send_socket = None
+        listener.join(timeout=2.0)
         log.info("PeerDiscovery stopped")
 
     def shutdown(self) -> None:
         """Signal the discovery thread to stop."""
         self._running.clear()
+        self._stop_event.set()
+        for active_socket in (self._send_socket, self._listen_socket):
+            if active_socket is not None:
+                try:
+                    active_socket.close()
+                except OSError:
+                    pass
         if self._prober:
             self._prober.shutdown()
+            if self._prober.is_alive():
+                self._prober.join(timeout=2.0)
+        if self.is_alive() and threading.current_thread() is not self:
+            self.join(timeout=3.0)
 
     def get_active_peers(self) -> dict[str, float]:
         """Return a copy of the active peers dict."""
@@ -747,6 +921,7 @@ class PeerDiscovery(threading.Thread):
     def _listen_loop(self) -> None:
         """Listen for incoming beacons from other peers."""
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._listen_socket = sock
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.settimeout(1.0)
 
@@ -759,7 +934,12 @@ class PeerDiscovery(threading.Thread):
         while self._running.is_set():
             try:
                 data, addr = sock.recvfrom(MAX_BEACON_SIZE + 1)
-                beacon = parse_discovery_beacon(data, addr[0], self._transfer_port)
+                beacon = parse_discovery_beacon(
+                    data,
+                    addr[0],
+                    self._transfer_port,
+                    replay_cache=self._replay_cache,
+                )
                 if beacon is None:
                     continue
                 if self._identity and beacon["device_id"] == self._identity.device_id:
@@ -789,7 +969,11 @@ class PeerDiscovery(threading.Thread):
             except OSError as e:
                 log.debug("Listen error: %s", e)
 
-        sock.close()
+        try:
+            sock.close()
+        except OSError:
+            pass
+        self._listen_socket = None
 
     def _sweep_peers(self) -> None:
         """Remove peers not seen within PEER_TIMEOUT seconds."""

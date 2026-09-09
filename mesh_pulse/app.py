@@ -30,12 +30,15 @@ from textual.widgets import (
     Static,
 )
 
-from mesh_pulse.core.discovery import PeerManager, UDPBroadcaster
-from mesh_pulse.core.history import TransferHistoryStore
-from mesh_pulse.core.identity import DeviceIdentity
-from mesh_pulse.core.monitor import SystemMonitor
-from mesh_pulse.core.transfer import SecureTransfer, TransferInfo, TransferStatus
-from mesh_pulse.core.trust import TrustStatus, TrustStore
+from mesh_pulse.core.composition import build_services
+from mesh_pulse.core.events import (
+    IncomingTransferOffered,
+    TransferCompleted,
+    TransferEvent,
+    TransferFailed,
+)
+from mesh_pulse.core.transfer import TransferInfo, TransferStatus
+from mesh_pulse.core.trust import TrustStatus
 from mesh_pulse.tui.dashboard import DashboardScreen
 from mesh_pulse.tui.screens.history import GlobalHistoryScreen
 from mesh_pulse.tui.screens.inbox import InboxScreen
@@ -593,7 +596,7 @@ class SendFileModal(ModalScreen):
 
 
 class MeshPulseApp(App):
-    """Mesh-Pulse Command Center — TUI Application."""
+    """Mesh-Pulse peer workspace application."""
 
     TITLE = "Mesh-Pulse"
     SUB_TITLE = "Local encrypted peer workspace"
@@ -622,34 +625,33 @@ class MeshPulseApp(App):
     ):
         super().__init__(**kwargs)
         self.event_log = EventLog()
-        self.legacy_mode = passphrase is not None
-        self.monitor = SystemMonitor()
-        self.identity = DeviceIdentity.load_or_create(identity_directory)
-        self.trust_store = TrustStore(self.identity.directory / "trusted_devices.json")
-        self.history_store = TransferHistoryStore(
-            self.identity.directory / "history.db"
-        )
-        self.peer_manager = PeerManager(trust_store=self.trust_store)
-        self.broadcaster = UDPBroadcaster(
-            peer_manager=self.peer_manager,
+        services = build_services(
+            passphrase=passphrase,
             broadcast_port=broadcast_port,
             transfer_port=transfer_port,
-            local_metrics_fn=lambda: self.monitor.latest.to_broadcast_dict(),
-            identity=self.identity,
-            transfer_protocol=2 if self.legacy_mode else 3,
-        )
-        self.transfer = SecureTransfer(
-            passphrase=passphrase or "",
-            transfer_port=transfer_port,
-            receive_dir=RECEIVE_DIR,
+            identity_directory=identity_directory,
             on_file_received=self._on_file_received,
-            on_incoming_request=self._on_incoming_request,
-            history_store=self.history_store,
-            identity=self.identity,
-            trust_store=self.trust_store,
-            peer_resolver=self.peer_manager.get_peer,
-            legacy_mode=self.legacy_mode,
+            on_event=self._on_transfer_event,
         )
+        self.legacy_mode = services.legacy_mode
+        self.monitor = services.monitor
+        self.identity = services.identity
+        self.trust_store = services.trust_store
+        self.history_store = services.history_store
+        self.peer_manager = services.peer_manager
+        self.broadcaster = services.broadcaster
+        self.transfer = services.transfer
+
+    def _on_transfer_event(self, event: TransferEvent) -> None:
+        """Translate core events into Textual-thread-safe application updates."""
+        if isinstance(event, IncomingTransferOffered):
+            self._on_incoming_request(event.request)
+        elif isinstance(event, (TransferCompleted, TransferFailed)):
+            transfer = event.transfer
+            self.peer_manager.record_transfer_result(
+                transfer.peer_device_id or transfer.peer_ip,
+                success=isinstance(event, TransferCompleted),
+            )
 
     def _on_incoming_request(self, request) -> None:
         """Publish an authenticated offer to Textual from its worker thread."""
@@ -801,7 +803,15 @@ class MeshPulseApp(App):
                         all_files.append(item)
 
                 if all_files:
-                    self.transfer.send_file(peer_ip, all_files, message=message)
+                    try:
+                        self.transfer.send_file(peer_ip, all_files, message=message)
+                    except RuntimeError as error:
+                        log.warning("Unable to start transfer: %s", error)
+                        self.notify(
+                            "Too many transfers are already active.",
+                            severity="warning",
+                        )
+                        return
                     count = len(all_files)
                     msg = f"Started sending {count} file{'s' if count > 1 else ''} to {peer_ip}"
                     if message:
@@ -917,6 +927,6 @@ class MeshPulseApp(App):
 
     def on_unmount(self) -> None:
         log.info("Mesh-Pulse shutting down…")
+        self.transfer.stop_server()
         self.broadcaster.stop()
         self.monitor.stop()
-        self.transfer.stop_server()

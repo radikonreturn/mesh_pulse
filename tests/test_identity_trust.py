@@ -5,7 +5,9 @@ from __future__ import annotations
 import base64
 import json
 import os
+import secrets
 import stat
+import time
 
 from mesh_pulse.core.discovery import (
     DISCOVERY_PROTOCOL,
@@ -104,7 +106,8 @@ def _beacon(
         "ip": "203.0.113.200",
         "port": 5000,
         "public_key": identity.public_key,
-        "timestamp": 1.0,
+        "timestamp": time.time(),
+        "nonce": secrets.token_urlsafe(12),
         "metrics": {
             "cpu_percent": 21,
             "ram_percent": 43,

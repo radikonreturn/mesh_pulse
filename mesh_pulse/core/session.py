@@ -154,7 +154,7 @@ def _receive_json(sock) -> dict:
     raw = unpack_frame(sock, max_size=MAX_HANDSHAKE_SIZE)
     try:
         payload = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as error:
         raise ProtocolError("Invalid pairing response") from error
     if not isinstance(payload, dict):
         raise ProtocolError("Invalid pairing response")

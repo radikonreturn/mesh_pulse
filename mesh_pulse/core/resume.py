@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from mesh_pulse.core.session import ProtocolError
-from mesh_pulse.core.transfer_protocol import TransferOffer
+from mesh_pulse.core.transfer_protocol import TransferOffer, validate_filename
 from mesh_pulse.utils.logger import get_logger
 
 log = get_logger(__name__)
@@ -21,9 +21,10 @@ log = get_logger(__name__)
 def resolve_destination_collision(receive_dir: str | Path, filename: str) -> Path:
     """Return a path that does not currently exist, preserving the extension."""
     directory = Path(receive_dir).resolve()
-    safe_name = Path(filename).name
-    if safe_name in {"", ".", ".."} or safe_name != filename:
-        raise ValueError("Invalid destination filename")
+    try:
+        safe_name = validate_filename(filename)
+    except ProtocolError as error:
+        raise ValueError("Invalid destination filename") from error
     suffix = "".join(Path(safe_name).suffixes)
     stem = safe_name[: -len(suffix)] if suffix else safe_name
     candidate = directory / safe_name
@@ -57,7 +58,8 @@ def commit_partial_file(
             )
             break
 
-    # Fallback path: copy verified partial to temporary file inside receive_dir, then atomic rename
+    # Fallback path: fully copy to a hidden same-directory file, then reserve a
+    # collision name with O_EXCL before atomically replacing our own reservation.
     temp_path = directory / f".tmp-commit-{uuid.uuid4().hex}"
     try:
         with open(partial_path, "rb") as src, open(temp_path, "wb") as dst:
@@ -68,19 +70,37 @@ def commit_partial_file(
         while True:
             destination = resolve_destination_collision(directory, filename)
             try:
-                if os.name == "nt":
-                    try:
-                        os.rename(temp_path, destination)
-                        break
-                    except FileExistsError:
-                        continue
-
-                if destination.exists():
-                    continue
-                os.replace(temp_path, destination)
-                break
+                descriptor = os.open(
+                    destination,
+                    os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                    0o600,
+                )
             except FileExistsError:
                 continue
+            try:
+                reservation = os.fstat(descriptor)
+            finally:
+                os.close(descriptor)
+            try:
+                current = destination.stat()
+                if (current.st_dev, current.st_ino) != (
+                    reservation.st_dev,
+                    reservation.st_ino,
+                ):
+                    raise FileExistsError("Destination reservation changed")
+                os.replace(temp_path, destination)
+                break
+            except OSError:
+                try:
+                    current = destination.stat()
+                    if (current.st_dev, current.st_ino) == (
+                        reservation.st_dev,
+                        reservation.st_ino,
+                    ):
+                        destination.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                raise
 
         partial_path.unlink(missing_ok=True)
         return destination
