@@ -628,6 +628,7 @@ class MeshPulseApp(App):
             transfer_port=transfer_port,
             local_metrics_fn=lambda: self.monitor.latest.to_broadcast_dict(),
             identity=self.identity,
+            transfer_protocol=2 if self.legacy_mode else 3,
         )
         self.transfer = SecureTransfer(
             passphrase=passphrase or "",
@@ -686,6 +687,7 @@ class MeshPulseApp(App):
                 monitor=self.monitor,
                 transfer_engine=self.transfer,
                 event_log=self.event_log,
+                legacy_mode=self.legacy_mode,
             )
         )
         self.event_log.log("Dashboard ready", "success")
@@ -705,6 +707,23 @@ class MeshPulseApp(App):
         selected_peer = (
             self.peer_manager.get_peer(preselect_ip) if preselect_ip else None
         )
+
+        local_protocol = 2 if self.legacy_mode else 3
+
+        if (
+            selected_peer is not None
+            and selected_peer.protocol_version != local_protocol
+        ):
+            self.notify(
+                (
+                    f"Peer requires transfer protocol "
+                    f"v{selected_peer.protocol_version}; "
+                    f"this node is running v{local_protocol}."
+                ),
+                severity="warning",
+            )
+            return
+
         if (
             selected_peer is not None
             and not self.legacy_mode
@@ -719,6 +738,21 @@ class MeshPulseApp(App):
             if result:
                 peer_ip, items, message = result
                 peer = self.peer_manager.get_peer(peer_ip)
+                if peer is not None and peer.protocol_version != local_protocol:
+                    self.event_log.log(
+                        (
+                            f"Blocked incompatible transfer to {peer_ip}: "
+                            f"peer=v{peer.protocol_version}, "
+                            f"local=v{local_protocol}"
+                        ),
+                        "warning",
+                    )
+                    self.notify(
+                        "Peer uses an incompatible transfer protocol.",
+                        severity="warning",
+                    )
+                    return
+
                 if not self.legacy_mode and (
                     peer is None or peer.trust_status != TrustStatus.TRUSTED
                 ):
@@ -800,8 +834,13 @@ class MeshPulseApp(App):
             )
 
     def action_settings(self) -> None:
-        """Open the Settings screen."""
-        self.push_screen(SettingsScreen())
+        """Open settings and local identity information."""
+        self.push_screen(
+            SettingsScreen(
+                identity=self.identity,
+                legacy_mode=self.legacy_mode,
+            )
+        )
 
     def action_refresh_all(self) -> None:
         self.refresh()

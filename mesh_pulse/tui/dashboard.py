@@ -21,19 +21,31 @@ from mesh_pulse.utils.config import HOSTNAME, LOCAL_IP
 class NodeHeader(Static):
     """Compact application and local-node status header."""
 
-    def __init__(self, peer_manager: PeerManager, **kwargs):
+    def __init__(
+        self,
+        peer_manager: PeerManager,
+        legacy_mode: bool = False,
+        **kwargs,
+    ):
         super().__init__(**kwargs)
         self._pm = peer_manager
+        self._legacy_mode = legacy_mode
 
     def on_mount(self) -> None:
         self.refresh_status()
-        self.set_interval(2.0, self.refresh_status)
+        self.set_interval(
+            2.0,
+            self.refresh_status,
+        )
 
     def refresh_status(self) -> None:
         count = self._pm.count
         peers = f"{count} peer" if count == 1 else f"{count} peers"
+
+        security = "legacy v2" if self._legacy_mode else "authenticated v3"
+
         self.update(
-            f"Mesh-Pulse\n[dim]{HOSTNAME} · {LOCAL_IP} · {peers} · secure[/dim]"
+            f"Mesh-Pulse\n[dim]{HOSTNAME} · {LOCAL_IP} · {peers} · {security}[/dim]"
         )
 
 
@@ -46,6 +58,7 @@ class DashboardScreen(Screen):
         monitor: SystemMonitor,
         transfer_engine: SecureTransfer,
         event_log: EventLog,
+        legacy_mode: bool = False,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -53,6 +66,7 @@ class DashboardScreen(Screen):
         self._monitor = monitor
         self._transfer = transfer_engine
         self._event_log = event_log
+        self._legacy_mode = legacy_mode
 
     @property
     def selected_peer(self) -> Peer | None:
@@ -60,7 +74,11 @@ class DashboardScreen(Screen):
         return self.query_one(PeerListWidget).selected_peer
 
     def compose(self) -> ComposeResult:
-        yield NodeHeader(self._pm, id="header")
+        yield NodeHeader(
+            self._pm,
+            legacy_mode=self._legacy_mode,
+            id="header",
+        )
         yield Container(PeerListWidget(self._pm), id="peer-panel")
         yield Container(SystemHealthWidget(self._monitor), id="health-panel")
         yield Container(TransferBarWidget(self._transfer), id="transfer-panel")

@@ -1,8 +1,4 @@
-"""In-TUI Settings screen — configure ports and receive directory.
-
-Keybind: [G] from the main dashboard opens this screen.
-Changes are saved to ~/.mesh_pulse_config.json and take effect on next launch.
-"""
+"""Mesh-Pulse configuration and local device identity."""
 
 from __future__ import annotations
 
@@ -14,6 +10,7 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import Screen
 from textual.widgets import Button, Input, Label, Static
 
+from mesh_pulse.core.identity import DeviceIdentity
 from mesh_pulse.utils.config import (
     BROADCAST_PORT,
     RECEIVE_DIR,
@@ -24,36 +21,76 @@ from mesh_pulse.utils.config import (
 
 
 class SettingsScreen(Screen):
-    """Settings screen — edit persistent configuration values.
+    """Configuration screen with local cryptographic identity."""
 
-    Fields:
-        Broadcast Port    — UDP discovery port (default 37020)
-        Transfer Port     — TCP file transfer port (default 5000)
-        Receive Directory — where incoming files are saved
-    """
+    TITLE = "Settings"
+    SUB_TITLE = "Mesh-Pulse configuration"
 
-    TITLE = "⚙ Settings"
-    SUB_TITLE = "Changes saved to ~/.mesh_pulse_config.json"
+    BINDINGS: ClassVar[list[Binding]] = [
+        Binding(
+            "escape",
+            "go_back",
+            "Back",
+            priority=True,
+        ),
+        Binding(
+            "ctrl+s",
+            "save",
+            "Save",
+        ),
+    ]
 
     DEFAULT_CSS = """
     SettingsScreen {
-        background: #0d1117;
-        padding: 2 4;
+        background: $surface;
+        padding: 1 3;
+        overflow-y: auto;
     }
 
     #settings-title {
         width: 100%;
-        text-align: center;
+        height: 2;
         text-style: bold;
-        color: #58a6ff;
-        padding: 0 0 1 0;
+        color: $text;
     }
 
     #settings-subtitle {
         width: 100%;
-        text-align: center;
-        color: #8b949e;
-        padding: 0 0 2 0;
+        color: $text-muted;
+        margin-bottom: 1;
+    }
+
+    #identity-panel {
+        width: 100%;
+        height: auto;
+        background: $surface-darken-1;
+        border: solid $panel;
+        padding: 1 2;
+        margin-bottom: 1;
+    }
+
+    .section-title {
+        color: $text;
+        text-style: bold;
+        margin-bottom: 1;
+    }
+
+    .identity-label {
+        color: $text-muted;
+    }
+
+    .identity-value {
+        color: $text;
+        text-style: bold;
+        margin-bottom: 1;
+    }
+
+    #security-mode {
+        color: $success;
+    }
+
+    #security-mode.legacy {
+        color: $warning;
     }
 
     .field-group {
@@ -62,130 +99,194 @@ class SettingsScreen(Screen):
     }
 
     .field-label {
-        color: #58a6ff;
+        color: $text;
         text-style: bold;
-        margin: 0 0 0 0;
     }
 
     .field-hint {
-        color: #484f58;
-        margin: 0 0 0 1;
+        color: $text-muted;
     }
 
     .field-input {
         width: 100%;
-        background: #161b22;
-        border: tall #30363d;
-        color: #e6edf3;
-        margin: 0;
+        background: $surface-darken-1;
+        border: tall $panel;
+        color: $text;
     }
 
     .field-input:focus {
-        border: tall #0ea5e9;
-    }
-
-    #divider {
-        color: #30363d;
-        margin: 1 0;
+        border: tall $accent;
     }
 
     #btn-row {
         width: 100%;
         height: 3;
-        align: center middle;
-        margin-top: 2;
+        align: left middle;
+        margin-top: 1;
     }
 
-    #save-btn {
-        margin: 0 1;
-        min-width: 18;
-    }
-
-    #reset-btn {
-        margin: 0 1;
-        min-width: 18;
-    }
-
-    #back-btn {
-        margin: 0 1;
-        min-width: 14;
+    #btn-row Button {
+        margin-right: 1;
     }
 
     #status-bar {
         width: 100%;
-        text-align: center;
-        color: #3fb950;
-        height: 1;
-        margin-top: 1;
+        height: 2;
+        color: $text-muted;
     }
     """
 
-    BINDINGS: ClassVar[list[Binding]] = [
-        Binding("escape", "go_back", "Back", priority=True),
-        Binding("ctrl+s", "save", "Save"),
-    ]
+    def __init__(
+        self,
+        identity: DeviceIdentity,
+        legacy_mode: bool = False,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self._identity = identity
+        self._legacy_mode = legacy_mode
 
     def compose(self) -> ComposeResult:
         cfg = load_user_config()
 
-        yield Static("Mesh-Pulse settings", id="settings-title")
         yield Static(
-            "Changes are saved to ~/.mesh_pulse_config.json and apply on next launch",
+            "Mesh-Pulse settings",
+            id="settings-title",
+        )
+
+        yield Static(
+            "Configuration changes apply on the next launch.",
             id="settings-subtitle",
         )
 
-        # Broadcast Port
+        with Vertical(id="identity-panel"):
+            yield Static(
+                "LOCAL IDENTITY",
+                classes="section-title",
+            )
+
+            yield Static(
+                "Device ID",
+                classes="identity-label",
+            )
+            yield Static(
+                self._identity.device_id,
+                classes="identity-value",
+            )
+
+            yield Static(
+                "Fingerprint",
+                classes="identity-label",
+            )
+            yield Static(
+                self._identity.fingerprint,
+                classes="identity-value",
+            )
+
+            yield Static(
+                "Transfer security",
+                classes="identity-label",
+            )
+
+            security = Static(
+                (
+                    "Legacy protocol v2 · shared passphrase"
+                    if self._legacy_mode
+                    else "Authenticated protocol v3 · trusted devices"
+                ),
+                id="security-mode",
+            )
+
+            if self._legacy_mode:
+                security.add_class("legacy")
+
+            yield security
+
         with Vertical(classes="field-group"):
-            yield Label("Broadcast port · UDP discovery", classes="field-label")
             yield Label(
-                f"Default: {BROADCAST_PORT}  ·  MESH_PULSE_BCAST_PORT env var overrides this",
+                "Broadcast port",
+                classes="field-label",
+            )
+            yield Label(
+                (
+                    f"UDP discovery · default {BROADCAST_PORT} · "
+                    "MESH_PULSE_BCAST_PORT overrides"
+                ),
                 classes="field-hint",
             )
             yield Input(
-                value=str(cfg.get("broadcast_port", BROADCAST_PORT)),
-                placeholder=str(BROADCAST_PORT),
+                value=str(
+                    cfg.get(
+                        "broadcast_port",
+                        BROADCAST_PORT,
+                    )
+                ),
                 id="bcast-port-input",
                 classes="field-input",
             )
 
-        # Transfer Port
         with Vertical(classes="field-group"):
-            yield Label("Transfer port · TCP", classes="field-label")
             yield Label(
-                f"Default: {TRANSFER_PORT}  ·  MESH_PULSE_XFER_PORT env var overrides this",
+                "Transfer port",
+                classes="field-label",
+            )
+            yield Label(
+                (
+                    f"TCP transfer · default {TRANSFER_PORT} · "
+                    "MESH_PULSE_XFER_PORT overrides"
+                ),
                 classes="field-hint",
             )
             yield Input(
-                value=str(cfg.get("transfer_port", TRANSFER_PORT)),
-                placeholder=str(TRANSFER_PORT),
+                value=str(
+                    cfg.get(
+                        "transfer_port",
+                        TRANSFER_PORT,
+                    )
+                ),
                 id="xfer-port-input",
                 classes="field-input",
             )
 
-        # Receive Directory
         with Vertical(classes="field-group"):
-            yield Label("Receive directory", classes="field-label")
             yield Label(
-                "Where incoming files are saved  ·  MESH_PULSE_RECEIVE_DIR env var overrides",
+                "Receive directory",
+                classes="field-label",
+            )
+            yield Label(
+                "Incoming file destination",
                 classes="field-hint",
             )
             yield Input(
-                value=cfg.get("receive_dir", RECEIVE_DIR),
-                placeholder=RECEIVE_DIR,
+                value=cfg.get(
+                    "receive_dir",
+                    RECEIVE_DIR,
+                ),
                 id="recv-dir-input",
                 classes="field-input",
             )
 
-        yield Static("", id="divider")
-
         with Horizontal(id="btn-row"):
-            yield Button("Save", variant="success", id="save-btn")
-            yield Button("Reset defaults", variant="warning", id="reset-btn")
-            yield Button("Back", id="back-btn")
+            yield Button(
+                "Save",
+                variant="success",
+                id="save-btn",
+            )
+            yield Button(
+                "Reset defaults",
+                id="reset-btn",
+            )
+            yield Button(
+                "Back",
+                id="back-btn",
+            )
 
         yield Static("", id="status-bar")
 
-    def on_button_pressed(self, event: Button.Pressed) -> None:
+    def on_button_pressed(
+        self,
+        event: Button.Pressed,
+    ) -> None:
         if event.button.id == "save-btn":
             self.action_save()
         elif event.button.id == "reset-btn":
@@ -194,32 +295,53 @@ class SettingsScreen(Screen):
             self.action_go_back()
 
     def action_save(self) -> None:
-        """Validate inputs and persist to config file."""
-        errors = []
+        errors: list[str] = []
 
         try:
-            bcast_port = int(self.query_one("#bcast-port-input", Input).value.strip())
-            if not (1024 <= bcast_port <= 65535):
+            bcast_port = int(
+                self.query_one(
+                    "#bcast-port-input",
+                    Input,
+                ).value.strip()
+            )
+
+            if not 1024 <= bcast_port <= 65535:
                 raise ValueError
+
         except ValueError:
-            errors.append("Broadcast port must be 1024–65535")
+            errors.append("Broadcast port must be 1024-65535")
             bcast_port = BROADCAST_PORT
 
         try:
-            xfer_port = int(self.query_one("#xfer-port-input", Input).value.strip())
-            if not (1024 <= xfer_port <= 65535):
+            xfer_port = int(
+                self.query_one(
+                    "#xfer-port-input",
+                    Input,
+                ).value.strip()
+            )
+
+            if not 1024 <= xfer_port <= 65535:
                 raise ValueError
+
         except ValueError:
-            errors.append("Transfer port must be 1024–65535")
+            errors.append("Transfer port must be 1024-65535")
             xfer_port = TRANSFER_PORT
 
-        recv_dir = self.query_one("#recv-dir-input", Input).value.strip()
+        recv_dir = self.query_one(
+            "#recv-dir-input",
+            Input,
+        ).value.strip()
+
         if not recv_dir:
             errors.append("Receive directory cannot be empty")
 
-        status = self.query_one("#status-bar", Static)
+        status = self.query_one(
+            "#status-bar",
+            Static,
+        )
+
         if errors:
-            status.update("  ⚠  " + "  ·  ".join(errors))
+            status.update(" · ".join(errors))
             status.styles.color = "red"
             return
 
@@ -230,16 +352,32 @@ class SettingsScreen(Screen):
                 "receive_dir": recv_dir,
             }
         )
-        status.update("Settings saved · restart to apply port or directory changes")
+
+        status.update("Settings saved · restart Mesh-Pulse to apply.")
         status.styles.color = "green"
 
     def _reset_defaults(self) -> None:
-        """Clear the config file and reset inputs to built-in defaults."""
         save_user_config({})
-        self.query_one("#bcast-port-input", Input).value = str(BROADCAST_PORT)
-        self.query_one("#xfer-port-input", Input).value = str(TRANSFER_PORT)
-        self.query_one("#recv-dir-input", Input).value = RECEIVE_DIR
-        self.query_one("#status-bar", Static).update("Defaults restored")
+
+        self.query_one(
+            "#bcast-port-input",
+            Input,
+        ).value = str(BROADCAST_PORT)
+
+        self.query_one(
+            "#xfer-port-input",
+            Input,
+        ).value = str(TRANSFER_PORT)
+
+        self.query_one(
+            "#recv-dir-input",
+            Input,
+        ).value = RECEIVE_DIR
+
+        self.query_one(
+            "#status-bar",
+            Static,
+        ).update("Defaults restored")
 
     def action_go_back(self) -> None:
         self.app.pop_screen()

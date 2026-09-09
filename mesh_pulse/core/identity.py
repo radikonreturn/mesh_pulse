@@ -118,13 +118,21 @@ class DeviceIdentity:
 
         public_key = encode_public_key(private_key.public_key())
         stored_metadata = cls._load_metadata(metadata_path)
+
+        # Device ID MUST always be cryptographically bound to the current public key.
+        # Never trust identity.json to override this relationship.
+        derived_device_id = device_id_from_public_key(public_key)
         stored_device_id = stored_metadata.get("device_id")
-        device_id = (
-            stored_device_id
-            if isinstance(stored_device_id, str)
-            and DEVICE_ID_PATTERN.fullmatch(stored_device_id)
-            else device_id_from_public_key(public_key)
-        )
+
+        if isinstance(stored_device_id, str) and stored_device_id != derived_device_id:
+            log.warning(
+                "Stored device ID does not match the current identity key; "
+                "repairing metadata (%s -> %s)",
+                stored_device_id,
+                derived_device_id,
+            )
+
+        device_id = derived_device_id
         fingerprint = fingerprint_from_public_key(public_key)
         stored_created_at = stored_metadata.get("created_at")
         try:

@@ -252,3 +252,56 @@ def test_trusted_v3_loopback_transfer(tmp_path):
         assert server.get_transfers()[-1].peer_device_id == client_identity.device_id
     finally:
         server.shutdown()
+
+
+def test_v3_client_rejects_discovered_v2_peer(tmp_path):
+    identity = DeviceIdentity.load_or_create(tmp_path / "client")
+
+    store = TrustStore(tmp_path / "trust.json")
+
+    peer = SimpleNamespace(
+        protocol_version=2,
+    )
+
+    client = FileClient(
+        identity=identity,
+        trust_store=store,
+        peer_resolver=lambda _ip: peer,
+        legacy_mode=False,
+    )
+
+    with pytest.raises(
+        ProtocolError,
+        match="Incompatible transfer protocol",
+    ):
+        client._assert_peer_protocol(
+            "192.0.2.20",
+            3,
+        )
+
+
+def test_legacy_client_rejects_discovered_v3_peer(tmp_path):
+    identity = DeviceIdentity.load_or_create(tmp_path / "client")
+
+    store = TrustStore(tmp_path / "trust.json")
+
+    peer = SimpleNamespace(
+        protocol_version=3,
+    )
+
+    client = FileClient(
+        passphrase="legacy-key",
+        identity=identity,
+        trust_store=store,
+        peer_resolver=lambda _ip: peer,
+        legacy_mode=True,
+    )
+
+    with pytest.raises(
+        ProtocolError,
+        match="Incompatible transfer protocol",
+    ):
+        client._assert_peer_protocol(
+            "192.0.2.20",
+            2,
+        )

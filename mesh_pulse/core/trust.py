@@ -15,6 +15,7 @@ from mesh_pulse.core.identity import (
     DEVICE_ID_PATTERN,
     decode_public_key,
     default_app_dir,
+    device_id_from_public_key,
     fingerprint_from_public_key,
 )
 from mesh_pulse.utils.logger import get_logger
@@ -79,9 +80,16 @@ class TrustStore:
 
     @staticmethod
     def _validate(device_id: str, public_key: str) -> None:
+        """Validate that a device ID is cryptographically bound to its public key."""
         decode_public_key(public_key)
+
         if not isinstance(device_id, str) or not DEVICE_ID_PATTERN.fullmatch(device_id):
             raise ValueError("Invalid device ID")
+
+        expected_device_id = device_id_from_public_key(public_key)
+
+        if device_id != expected_device_id:
+            raise ValueError("Device ID does not match the supplied public key")
 
     def _save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)

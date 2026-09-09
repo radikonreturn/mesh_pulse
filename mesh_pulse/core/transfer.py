@@ -584,6 +584,37 @@ class FileClient:
         with self._lock:
             return list(self._transfers)
 
+    def _assert_peer_protocol(
+        self,
+        peer_ip: str,
+        expected_protocol: int,
+    ) -> None:
+        """Fail before connecting when discovery reports an incompatible peer."""
+
+        if self._peer_resolver is None:
+            # Keep low-level/manual legacy clients backwards compatible.
+            return
+
+        peer = self._peer_resolver(peer_ip)
+
+        if peer is None:
+            if expected_protocol == PROTOCOL_VERSION:
+                raise AuthenticationError("Peer identity is unavailable")
+            return
+
+        remote_protocol = getattr(
+            peer,
+            "protocol_version",
+            None,
+        )
+
+        if remote_protocol is not None and remote_protocol != expected_protocol:
+            raise ProtocolError(
+                f"Incompatible transfer protocol: "
+                f"peer requires v{remote_protocol}, "
+                f"local mode is v{expected_protocol}"
+            )
+
     # ── Workers ─────────────────────────────────────────────────────
 
     def _batch_worker(
@@ -681,28 +712,36 @@ class FileClient:
         infos: list[TransferInfo],
         message: str | None,
     ) -> None:
-        """Open one TCP connection and stream all files.
+        """Open one TCP connection and stream all files."""
 
-        Raises:
-            OSError / ConnectionError on network failure.
-        """
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        protocol_version = 2 if self._legacy_mode else PROTOCOL_VERSION
+
+        self._assert_peer_protocol(
+            peer_ip,
+            protocol_version,
+        )
+
+        sock = socket.socket(
+            socket.AF_INET,
+            socket.SOCK_STREAM,
+        )
         sock.settimeout(30)
+
         try:
             sock.connect((peer_ip, self._port))
 
             if self._legacy_mode:
                 session_key = self._key
-                protocol_version = 2
             else:
                 trusted_peer = self._resolve_trusted_peer(peer_ip)
+
                 authenticated = client_handshake(
                     sock,
                     self._identity,
                     trusted_peer,
                 )
+
                 session_key = authenticated.key
-                protocol_version = PROTOCOL_VERSION
 
             # ── Session header ──
             session_frame: dict = {

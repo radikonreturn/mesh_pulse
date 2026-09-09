@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import stat
@@ -9,11 +10,14 @@ import stat
 from mesh_pulse.core.discovery import (
     DISCOVERY_PROTOCOL,
     MAX_BEACON_SIZE,
+    PeerDiscovery,
     PeerManager,
+    _discovery_signed_bytes,
     parse_discovery_beacon,
 )
 from mesh_pulse.core.identity import (
     DeviceIdentity,
+    device_id_from_public_key,
     fingerprint_from_public_key,
 )
 from mesh_pulse.core.trust import TrustStatus, TrustStore
@@ -88,18 +92,31 @@ def test_invalid_trust_store_does_not_crash(tmp_path):
     assert store.all() == []
 
 
-def _beacon(identity: DeviceIdentity, **overrides) -> bytes:
+def _beacon(
+    identity: DeviceIdentity,
+    **overrides,
+) -> bytes:
     payload = {
         "protocol": DISCOVERY_PROTOCOL,
+        "transfer_protocol": 3,
         "device_id": identity.device_id,
         "hostname": "workstation",
         "ip": "203.0.113.200",
         "port": 5000,
         "public_key": identity.public_key,
         "timestamp": 1.0,
-        "metrics": {"cpu_percent": 21, "ram_percent": 43},
+        "metrics": {
+            "cpu_percent": 21,
+            "ram_percent": 43,
+        },
     }
+
     payload.update(overrides)
+
+    payload["signature"] = base64.b64encode(
+        identity.sign(_discovery_signed_bytes(payload))
+    ).decode("ascii")
+
     return json.dumps(payload).encode()
 
 
@@ -163,3 +180,118 @@ def test_new_peer_is_not_automatically_trusted(tmp_path):
         public_key=identity.public_key,
     )
     assert manager.get_peer(identity.device_id).trust_status == TrustStatus.NEW
+
+
+def test_discovery_rejects_tampered_signed_beacon(tmp_path):
+    identity = DeviceIdentity.load_or_create(tmp_path / "identity")
+
+    payload = json.loads(_beacon(identity).decode())
+
+    # Change signed content without re-signing it.
+    payload["hostname"] = "attacker"
+
+    tampered = json.dumps(payload).encode()
+
+    assert (
+        parse_discovery_beacon(
+            tampered,
+            "192.0.2.10",
+        )
+        is None
+    )
+
+
+def test_discovery_requires_device_id_public_key_binding(tmp_path):
+    identity = DeviceIdentity.load_or_create(tmp_path / "identity")
+
+    # Valid format, but not the ID derived from this key.
+    forged = _beacon(
+        identity,
+        device_id="mp-deadbeef",
+    )
+
+    assert (
+        parse_discovery_beacon(
+            forged,
+            "192.0.2.10",
+        )
+        is None
+    )
+
+
+def test_v3_discovery_advertises_transfer_v3(tmp_path):
+    identity = DeviceIdentity.load_or_create(tmp_path / "identity")
+
+    discovery = PeerDiscovery(
+        identity=identity,
+        transfer_protocol=3,
+    )
+
+    parsed = parse_discovery_beacon(
+        discovery._build_beacon(),
+        "192.0.2.10",
+    )
+
+    assert parsed is not None
+    assert parsed["device_id"] == identity.device_id
+    assert parsed["protocol_version"] == 3
+
+
+def test_signed_identity_can_advertise_legacy_transfer_v2(tmp_path):
+    identity = DeviceIdentity.load_or_create(tmp_path / "identity")
+
+    discovery = PeerDiscovery(
+        identity=identity,
+        transfer_protocol=2,
+    )
+
+    parsed = parse_discovery_beacon(
+        discovery._build_beacon(),
+        "192.0.2.10",
+    )
+
+    assert parsed is not None
+
+    # Discovery identity is still present and signed...
+    assert parsed["device_id"] == identity.device_id
+
+    # ...but file transfer mode is explicitly legacy.
+    assert parsed["protocol_version"] == 2
+
+
+def test_trust_store_rejects_mismatched_device_id_and_key(tmp_path):
+    identity = DeviceIdentity.load_or_create(tmp_path / "identity")
+
+    store = TrustStore(tmp_path / "trust.json")
+
+    try:
+        store.trust(
+            "mp-deadbeef",
+            "forged",
+            identity.public_key,
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("TrustStore accepted a forged device ID")
+
+
+def test_identity_metadata_cannot_override_derived_device_id(tmp_path):
+    DeviceIdentity.load_or_create(tmp_path)
+
+    metadata_path = tmp_path / "identity.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+
+    metadata["device_id"] = "mp-deadbeef"
+
+    metadata_path.write_text(
+        json.dumps(metadata),
+        encoding="utf-8",
+    )
+
+    repaired = DeviceIdentity.load_or_create(tmp_path)
+
+    expected = device_id_from_public_key(repaired.public_key)
+
+    assert repaired.device_id == expected
+    assert repaired.device_id != "mp-deadbeef"

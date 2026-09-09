@@ -11,6 +11,7 @@ Peers auto-transition: ONLINE → STALE → removed, based on heartbeat age.
 
 from __future__ import annotations
 
+import base64
 import json
 import math
 import re
@@ -21,9 +22,12 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
 
+from cryptography.exceptions import InvalidSignature
+
 from mesh_pulse.core.identity import (
     DeviceIdentity,
     decode_public_key,
+    device_id_from_public_key,
     fingerprint_from_public_key,
 )
 from mesh_pulse.core.trust import TrustStatus, TrustStore
@@ -55,6 +59,8 @@ _METRIC_FIELDS = {
     "net_sent_bytes",
     "net_recv_bytes",
 }
+_DISCOVERY_DOMAIN = b"mesh-pulse-discovery-v3\x00"
+SUPPORTED_TRANSFER_PROTOCOLS = {2, 3}
 
 
 # ─── Data Models ────────────────────────────────────────────────────
@@ -142,20 +148,136 @@ def _validated_metrics(metrics: object) -> dict:
     return clean
 
 
+def _canonical_discovery_payload(payload: dict) -> bytes:
+    """Canonical JSON representation used by discovery signatures."""
+    return json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+
+def _discovery_signed_bytes(payload: dict) -> bytes:
+    """Return the exact bytes covered by an identity signature."""
+    unsigned = {key: value for key, value in payload.items() if key != "signature"}
+    return _DISCOVERY_DOMAIN + _canonical_discovery_payload(unsigned)
+
+
+def _verify_discovery_signature(
+    payload: dict,
+    public_key: str,
+) -> bool:
+    """Verify a protocol-v3 UDP discovery advertisement."""
+    signature_text = payload.get("signature")
+
+    if not isinstance(signature_text, str) or len(signature_text) > 128:
+        return False
+
+    try:
+        signature = base64.b64decode(
+            signature_text,
+            validate=True,
+        )
+    except (ValueError, base64.binascii.Error):
+        return False
+
+    if len(signature) != 64:
+        return False
+
+    try:
+        key = decode_public_key(public_key)
+        key.verify(
+            signature,
+            _discovery_signed_bytes(payload),
+        )
+    except (ValueError, InvalidSignature):
+        return False
+
+    return True
+
+
+def build_discovery_beacon(
+    identity: DeviceIdentity | None,
+    *,
+    hostname: str = HOSTNAME,
+    advertised_ip: str = LOCAL_IP,
+    port: int = TRANSFER_PORT,
+    metrics: dict | None = None,
+    transfer_protocol: int = 3,
+    timestamp: float | None = None,
+) -> bytes:
+    """Create a validated discovery beacon.
+
+    Discovery schema v3 is independent from the file-transfer protocol.
+    A signed identity can therefore advertise transfer protocol v2 or v3
+    without lying about the discovery schema.
+    """
+
+    if transfer_protocol not in SUPPORTED_TRANSFER_PROTOCOLS:
+        raise ValueError("Unsupported transfer protocol")
+
+    if identity is None:
+        # Old anonymous discovery remains protocol 2.
+        payload: dict = {
+            "protocol": 2,
+            "hostname": hostname,
+            "ip": advertised_ip,
+            "port": port,
+            "timestamp": timestamp or time.time(),
+        }
+    else:
+        payload = {
+            "protocol": DISCOVERY_PROTOCOL,
+            "transfer_protocol": transfer_protocol,
+            "hostname": hostname,
+            "ip": advertised_ip,
+            "port": port,
+            "timestamp": timestamp or time.time(),
+            "device_id": identity.device_id,
+            "public_key": identity.public_key,
+        }
+
+    if metrics:
+        payload["metrics"] = metrics
+
+    if identity is not None:
+        signature = identity.sign(_discovery_signed_bytes(payload))
+        payload["signature"] = base64.b64encode(signature).decode("ascii")
+
+    encoded = _canonical_discovery_payload(payload)
+
+    if len(encoded) > MAX_BEACON_SIZE:
+        raise ValueError("Discovery beacon exceeds size limit")
+
+    return encoded
+
+
 def parse_discovery_beacon(
-    data: bytes, source_ip: str, default_port: int = TRANSFER_PORT
+    data: bytes,
+    source_ip: str,
+    default_port: int = TRANSFER_PORT,
 ) -> dict | None:
-    """Validate a UDP beacon and bind its network address to the packet source."""
+    """Validate an incoming discovery advertisement.
+
+    The UDP packet source remains authoritative for the network address.
+    Protocol-v3 identity advertisements must have a valid Ed25519
+    signature and a device ID derived from their public key.
+    """
+
     if not data or len(data) > MAX_BEACON_SIZE:
         return None
+
     try:
         payload = json.loads(data.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
         return None
+
     if not isinstance(payload, dict):
         return None
 
     hostname = payload.get("hostname", "unknown")
+
     if (
         not isinstance(hostname, str)
         or not hostname.strip()
@@ -165,14 +287,17 @@ def parse_discovery_beacon(
         return None
 
     port = payload.get("port", default_port)
+
     if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
         return None
 
     protocol = payload.get("protocol", 2)
+
     if isinstance(protocol, bool) or not isinstance(protocol, int):
         return None
 
     timestamp = payload.get("timestamp", time.time())
+
     if (
         isinstance(timestamp, bool)
         or not isinstance(timestamp, (int, float))
@@ -180,41 +305,78 @@ def parse_discovery_beacon(
     ):
         return None
 
-    device_id = payload.get("device_id")
-    public_key = payload.get("public_key")
-    fingerprint = None
+    try:
+        socket.inet_pton(socket.AF_INET, source_ip)
+    except OSError:
+        return None
+
+    device_id: str | None = None
+    public_key: str | None = None
+    fingerprint: str | None = None
+
+    # This field represents FILE TRANSFER protocol,
+    # not discovery schema.
+    transfer_protocol = 2
+
     if protocol == DISCOVERY_PROTOCOL:
+        device_id = payload.get("device_id")
+        public_key = payload.get("public_key")
+
         if (
             not isinstance(device_id, str)
             or not _DEVICE_ID_PATTERN.fullmatch(device_id)
             or not isinstance(public_key, str)
         ):
             return None
+
         try:
             decode_public_key(public_key)
-            fingerprint = fingerprint_from_public_key(public_key)
         except ValueError:
             return None
-    elif protocol != 2:
-        return None
-    else:
-        device_id = None
-        public_key = None
 
-    try:
-        socket.inet_pton(socket.AF_INET, source_ip)
-    except OSError:
+        # Cryptographically bind ID -> public key.
+        if device_id_from_public_key(public_key) != device_id:
+            return None
+
+        # A v3 identity advertisement without a valid signature
+        # must never reach PeerManager / TRUSTED UI state.
+        if not _verify_discovery_signature(
+            payload,
+            public_key,
+        ):
+            return None
+
+        transfer_protocol = payload.get(
+            "transfer_protocol",
+            3,
+        )
+
+        if (
+            isinstance(transfer_protocol, bool)
+            or not isinstance(transfer_protocol, int)
+            or transfer_protocol not in SUPPORTED_TRANSFER_PROTOCOLS
+        ):
+            return None
+
+        fingerprint = fingerprint_from_public_key(public_key)
+
+    elif protocol == 2:
+        # Backward-compatible anonymous/legacy peer.
+        transfer_protocol = 2
+
+    else:
         return None
 
     return {
         "hostname": hostname.strip(),
+        # Packet source is authoritative.
         "ip": source_ip,
         "port": port,
         "metrics": _validated_metrics(payload.get("metrics")),
         "device_id": device_id,
         "public_key": public_key,
         "fingerprint": fingerprint,
-        "protocol_version": protocol,
+        "protocol_version": transfer_protocol,
     }
 
 
@@ -487,6 +649,7 @@ class PeerDiscovery(threading.Thread):
         local_metrics_fn: Callable[[], dict] | None = None,
         peer_manager: PeerManager | None = None,
         identity: DeviceIdentity | None = None,
+        transfer_protocol: int = 3,
     ):
         super().__init__(daemon=True, name="peer-discovery")
         self._port = port
@@ -496,6 +659,11 @@ class PeerDiscovery(threading.Thread):
         self._local_metrics_fn = local_metrics_fn
         self._pm = peer_manager
         self._identity = identity
+
+        if transfer_protocol not in SUPPORTED_TRANSFER_PROTOCOLS:
+            raise ValueError(f"Unsupported transfer protocol: {transfer_protocol}")
+
+        self._transfer_protocol = transfer_protocol
         self._running = threading.Event()
         self._running.set()
 
@@ -526,7 +694,7 @@ class PeerDiscovery(threading.Thread):
             try:
                 beacon = self._build_beacon()
                 sock.sendto(beacon, (BROADCAST_ADDR, self._port))
-            except OSError as e:
+            except (OSError, ValueError) as e:
                 log.debug("Broadcast send error: %s", e)
 
             self._sweep_peers()
@@ -549,27 +717,32 @@ class PeerDiscovery(threading.Thread):
     # ── Internal ────────────────────────────────────────────────
 
     def _build_beacon(self) -> bytes:
-        """Build a JSON heartbeat beacon."""
-        payload: dict = {
-            "protocol": DISCOVERY_PROTOCOL if self._identity else 2,
-            "hostname": HOSTNAME,
-            "ip": LOCAL_IP,
-            "port": self._transfer_port,
-            "timestamp": time.time(),
-        }
-        if self._identity:
-            payload.update(
-                {
-                    "device_id": self._identity.device_id,
-                    "public_key": self._identity.public_key,
-                }
-            )
+        """Build a signed discovery heartbeat."""
+
+        metrics = None
+
         if self._local_metrics_fn:
             try:
-                payload["metrics"] = self._local_metrics_fn()
-            except (AttributeError, RuntimeError, TypeError, ValueError) as error:
-                log.debug("Unable to collect beacon metrics: %s", error)
-        return json.dumps(payload).encode("utf-8")
+                metrics = self._local_metrics_fn()
+            except (
+                AttributeError,
+                RuntimeError,
+                TypeError,
+                ValueError,
+            ) as error:
+                log.debug(
+                    "Unable to collect beacon metrics: %s",
+                    error,
+                )
+
+        return build_discovery_beacon(
+            self._identity,
+            hostname=HOSTNAME,
+            advertised_ip=LOCAL_IP,
+            port=self._transfer_port,
+            metrics=metrics,
+            transfer_protocol=self._transfer_protocol,
+        )
 
     def _listen_loop(self) -> None:
         """Listen for incoming beacons from other peers."""
@@ -656,6 +829,7 @@ class UDPBroadcaster:
         interval: float = BROADCAST_INTERVAL,
         local_metrics_fn: Callable[[], dict] | None = None,
         identity: DeviceIdentity | None = None,
+        transfer_protocol: int = 3,
     ):
         self._discovery = PeerDiscovery(
             port=broadcast_port,
@@ -664,6 +838,7 @@ class UDPBroadcaster:
             local_metrics_fn=local_metrics_fn,
             peer_manager=peer_manager,
             identity=identity,
+            transfer_protocol=transfer_protocol,
         )
 
     def start(self) -> None:
