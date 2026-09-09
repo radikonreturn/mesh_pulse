@@ -2,32 +2,41 @@
 
 ## Supported Versions
 
+Only the latest release receives security updates.
+
 | Version | Supported          |
-|---------|--------------------|
-| 1.0.x   | ✅ Yes             |
+| ------- | ------------------ |
+| 1.0.x   | :white_check_mark: |
+| < 1.0   | :x:                |
+
+---
 
 ## Reporting a Vulnerability
 
-If you discover a security vulnerability in Mesh-Pulse, please report it responsibly:
+The Mesh-Pulse team takes the security of local networking and cryptographic implementations seriously.
 
-1. **Do NOT open a public GitHub issue.**
-2. Email the maintainers directly with:
-   - A description of the vulnerability
-   - Steps to reproduce
-   - Potential impact
-3. You will receive an acknowledgement within **48 hours**.
-4. A fix will be prioritized and released as a patch version.
+If you believe you have discovered a security vulnerability in Mesh-Pulse:
 
-## Security Considerations
+1. **Do NOT open a public issue.** Public issues are visible to everyone and could put users at risk before a fix is available.
+2. **Report via GitHub Private Vulnerability Reporting:**
+   - Navigate to the repository's **Security** tab on GitHub.
+   - Click **Report a vulnerability** to open an encrypted advisory draft directly with the project maintainers.
+3. If GitHub Private Vulnerability Reporting is unavailable, open a minimal GitHub issue requesting a private security contact channel without including exploit code or vulnerability details.
 
-Mesh-Pulse uses the following cryptographic primitives:
+### What to Include
 
-- **Fernet (AES-128-CBC + HMAC-SHA256)** for file transfer encryption
-- **AES-256-GCM** (legacy backend) with PBKDF2-HMAC-SHA256 key derivation (480,000 iterations)
-- Encryption keys are stored at `~/.mesh_pulse_key` with owner-only file permissions
+Please provide:
+- A clear description of the vulnerability and affected components.
+- Step-by-step reproduction instructions or a minimal proof of concept.
+- An assessment of the potential impact on confidentiality, integrity, or availability.
 
-### Known Limitations
+### Disclosure Policy
 
-- Peer discovery beacons are **unencrypted** UDP broadcasts. A network observer can see which hosts are running Mesh-Pulse.
-- File transfers rely on both peers sharing the same encryption key. There is no key exchange protocol — the key must be distributed out-of-band.
-- The application binds to `0.0.0.0` by default, accepting connections from any network interface.
+- Maintainers will review the report and provide an initial response.
+- Once a fix is verified, a patch release will be published along with a security advisory acknowledging responsible disclosure.
+
+---
+
+## Security Architecture
+
+For a detailed breakdown of the cryptographic primitives, Ed25519 identity derivation, transcript-bound X25519 session keys, AES-256-GCM framing, and threat model boundaries, see [docs/security.md](docs/security.md).

@@ -1,0 +1,130 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  validate_and_build_packages:
+    name: Lint, Test, and Build Python Packages
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install ruff pytest build wheel
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install -e .
+
+      - name: Run Ruff check
+        run: ruff check .
+
+      - name: Run Ruff format check
+        run: ruff format --check .
+
+      - name: Run pytest
+        run: pytest -q
+
+      - name: Build wheel and sdist
+        run: python -m build
+
+      - name: Upload package artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-packages
+          path: |
+            dist/*.whl
+            dist/*.tar.gz
+
+  build_windows_standalone:
+    name: Build Standalone Windows Executable
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install . pyinstaller
+
+      - name: Build standalone Windows binary
+        run: python scripts/build_standalone.py
+
+      - name: Upload Windows standalone archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: standalone-windows-x64
+          path: dist/mesh-pulse-windows-x64.zip
+
+  build_linux_standalone:
+    name: Build Standalone Linux Executable
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install . pyinstaller
+
+      - name: Build standalone Linux binary
+        run: python scripts/build_standalone.py
+
+      - name: Upload Linux standalone archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: standalone-linux-x64
+          path: dist/mesh-pulse-linux-x64.tar.gz
+
+  publish_github_release:
+    name: Create GitHub Release
+    needs:
+      - validate_and_build_packages
+      - build_windows_standalone
+      - build_linux_standalone
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download all built artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release_artifacts
+          merge-multiple: true
+
+      - name: Create GitHub Release and attach artifacts
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release_artifacts/*
+          draft: false
+          prerelease: false
+          generate_release_notes: true

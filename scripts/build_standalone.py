@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import os
 import platform
-import shutil
 import subprocess
 import sys
 import tarfile
@@ -62,7 +60,9 @@ def main() -> int:
         return 1
     print(f"--help output verified ({len(help_res.stdout)} chars)")
 
-    ver_res = subprocess.run([str(exe_file), "--version"], capture_output=True, text=True)
+    ver_res = subprocess.run(
+        [str(exe_file), "--version"], capture_output=True, text=True
+    )
     if ver_res.returncode != 0:
         print(f"Smoke test failed for --version: {ver_res.stderr}")
         return 1
@@ -86,7 +86,9 @@ def main() -> int:
             if (repo_root / "README.md").exists():
                 tf.add(repo_root / "README.md", arcname="README.md")
 
-    print(f"Successfully generated archive: {archive_file} ({archive_file.stat().st_size:,} bytes)")
+    print(
+        f"Successfully generated archive: {archive_file} ({archive_file.stat().st_size:,} bytes)"
+    )
     return 0
 
 
