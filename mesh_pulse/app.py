@@ -31,11 +31,14 @@ from textual.widgets import (
 )
 
 from mesh_pulse.core.discovery import PeerManager, UDPBroadcaster
+from mesh_pulse.core.history import TransferHistoryStore
 from mesh_pulse.core.identity import DeviceIdentity
 from mesh_pulse.core.monitor import SystemMonitor
 from mesh_pulse.core.transfer import SecureTransfer, TransferInfo, TransferStatus
 from mesh_pulse.core.trust import TrustStatus, TrustStore
 from mesh_pulse.tui.dashboard import DashboardScreen
+from mesh_pulse.tui.screens.history import GlobalHistoryScreen
+from mesh_pulse.tui.screens.inbox import InboxScreen
 from mesh_pulse.tui.screens.peer_detail import PeerDetailScreen
 from mesh_pulse.tui.screens.settings import SettingsScreen
 from mesh_pulse.tui.widgets.event_log import EventLog
@@ -602,8 +605,10 @@ class MeshPulseApp(App):
         Binding("p", "peer_detail", "Peer Detail"),
         Binding("o", "open_received", "Open Received"),
         Binding("g", "settings", "Settings"),
+        Binding("i", "inbox", "Inbox"),
+        Binding("h", "history", "History"),
         Binding("r", "refresh_all", "Refresh"),
-        Binding("c", "clear_logs", "Clear Logs"),
+        Binding("c", "cancel_transfer", "Cancel Transfer"),
         Binding("d", "toggle_dark", "Toggle Dark"),
     ]
 
@@ -621,6 +626,9 @@ class MeshPulseApp(App):
         self.monitor = SystemMonitor()
         self.identity = DeviceIdentity.load_or_create(identity_directory)
         self.trust_store = TrustStore(self.identity.directory / "trusted_devices.json")
+        self.history_store = TransferHistoryStore(
+            self.identity.directory / "history.db"
+        )
         self.peer_manager = PeerManager(trust_store=self.trust_store)
         self.broadcaster = UDPBroadcaster(
             peer_manager=self.peer_manager,
@@ -635,11 +643,33 @@ class MeshPulseApp(App):
             transfer_port=transfer_port,
             receive_dir=RECEIVE_DIR,
             on_file_received=self._on_file_received,
+            on_incoming_request=self._on_incoming_request,
+            history_store=self.history_store,
             identity=self.identity,
             trust_store=self.trust_store,
             peer_resolver=self.peer_manager.get_peer,
             legacy_mode=self.legacy_mode,
         )
+
+    def _on_incoming_request(self, request) -> None:
+        """Publish an authenticated offer to Textual from its worker thread."""
+        peer = request.peer_name or request.peer_ip
+        count = len(request.files)
+        size_mb = request.total_size / (1024 * 1024)
+        message = (
+            f"Incoming transfer from {peer}: "
+            f"{count} file{'s' if count != 1 else ''} · {size_mb:.1f} MB"
+        )
+        try:
+            self.call_from_thread(self.event_log.log, message, "info")
+            self.call_from_thread(
+                self.notify,
+                message,
+                title="Incoming transfer",
+                severity="information",
+            )
+        except RuntimeError as error:
+            log.debug("Unable to post incoming transfer notification: %s", error)
 
     def _on_file_received(self, info: TransferInfo) -> None:
         """Called from FileServer thread when a file reception finishes."""
@@ -842,6 +872,17 @@ class MeshPulseApp(App):
             )
         )
 
+    def action_inbox(self) -> None:
+        """Open authenticated incoming transfer requests."""
+        if self.legacy_mode:
+            self.notify("Transfer approval is available in protocol v3.")
+            return
+        self.push_screen(InboxScreen(self.transfer, self.trust_store))
+
+    def action_history(self) -> None:
+        """Open persistent global transfer history."""
+        self.push_screen(GlobalHistoryScreen(self.history_store))
+
     def action_refresh_all(self) -> None:
         self.refresh()
         self.event_log.log("Manual refresh triggered", "info")
@@ -851,6 +892,28 @@ class MeshPulseApp(App):
         self.event_log.clear()
         self.event_log.log("Event log cleared", "info")
         self.notify("Logs cleared", severity="information")
+
+    def action_cancel_transfer(self) -> None:
+        """Cancel the most recent non-terminal outgoing transfer session."""
+        cancellable = {
+            TransferStatus.PENDING,
+            TransferStatus.PENDING_APPROVAL,
+            TransferStatus.ACCEPTED,
+            TransferStatus.ACTIVE,
+            TransferStatus.INTERRUPTED,
+            TransferStatus.RESUMING,
+        }
+        outgoing = [
+            transfer
+            for transfer in self.transfer.get_transfers()
+            if transfer.direction.value == "send" and transfer.status in cancellable
+        ]
+        if not outgoing:
+            self.notify("No active outgoing transfer to cancel.")
+            return
+        latest = max(outgoing, key=lambda transfer: transfer.started_at)
+        if self.transfer.cancel_transfer(latest.transfer_id):
+            self.notify("Cancelling transfer…", severity="warning")
 
     def on_unmount(self) -> None:
         log.info("Mesh-Pulse shutting down…")

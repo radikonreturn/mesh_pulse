@@ -84,7 +84,7 @@ class DashboardScreen(Screen):
         yield Container(TransferBarWidget(self._transfer), id="transfer-panel")
         yield Container(EventLogWidget(self._event_log), id="log-panel")
         yield Static(
-            "↑↓ Navigate  ·  Enter Details  ·  S Send  ·  G Settings  ·  Q Quit",
+            "↑↓ Navigate  ·  Enter Details  ·  S Send  ·  I Inbox  ·  H History  ·  Q Quit",
             id="footer",
         )
 

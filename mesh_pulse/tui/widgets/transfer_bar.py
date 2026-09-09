@@ -76,11 +76,24 @@ class TransferBarWidget(Static):
             ("  received", "dim"),
         )
 
-        active = [t for t in transfers if t.status == TransferStatus.ACTIVE]
+        active_statuses = {
+            TransferStatus.PENDING_APPROVAL,
+            TransferStatus.ACCEPTED,
+            TransferStatus.ACTIVE,
+            TransferStatus.INTERRUPTED,
+            TransferStatus.RESUMING,
+        }
+        active = [t for t in transfers if t.status in active_statuses]
         completed = [
             t
             for t in transfers
-            if t.status in (TransferStatus.COMPLETE, TransferStatus.FAILED)
+            if t.status
+            in {
+                TransferStatus.COMPLETE,
+                TransferStatus.FAILED,
+                TransferStatus.REJECTED,
+                TransferStatus.CANCELLED,
+            }
         ]
 
         rows: list = [header, totals, Text("")]
@@ -91,6 +104,7 @@ class TransferBarWidget(Static):
             for xfer in active[-5:]:
                 rows.append(self._render_transfer(xfer))
                 rows.append(Text(""))
+            rows.append(Text("  C Cancel latest outgoing transfer", style="dim"))
         else:
             rows.append(Text("  No recent transfers", style="dim italic"))
             rows.append(Text("  Press S to send a file.", style="dim"))
@@ -126,8 +140,9 @@ class TransferBarWidget(Static):
 
         bar = ProgressBar(total=100, completed=xfer.progress, width=28)
 
+        state = xfer.status.value.replace("_", " ").title()
         status_text = Text(
-            f"  {xfer.progress:5.1f}%  {xfer.speed_mbps:.1f} MB/s",
+            f"  {state}  ·  {xfer.progress:5.1f}%  ·  {xfer.speed_mbps:.1f} MB/s",
             style="bold bright_yellow",
         )
 
@@ -154,6 +169,14 @@ class TransferBarWidget(Static):
             icon = "✓"
             icon_style = "bold green"
             detail = f"{xfer.speed_mbps:.1f} MB/s"
+        elif xfer.status == TransferStatus.CANCELLED:
+            icon = "–"
+            icon_style = "bold yellow"
+            detail = "Cancelled"
+        elif xfer.status == TransferStatus.REJECTED:
+            icon = "–"
+            icon_style = "bold yellow"
+            detail = "Rejected"
         else:
             icon = "✗"
             icon_style = "bold red"

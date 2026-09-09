@@ -28,9 +28,11 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import select
 import socket
 import threading
 import time
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
@@ -38,7 +40,18 @@ from pathlib import Path
 
 from cryptography.exceptions import InvalidTag
 
+from mesh_pulse.core.history import (
+    TransferFileRecord,
+    TransferHistoryStore,
+    TransferRecord,
+)
 from mesh_pulse.core.identity import DeviceIdentity
+from mesh_pulse.core.inbox import (
+    IncomingRequestManager,
+    IncomingRequestStatus,
+    IncomingTransferRequest,
+)
+from mesh_pulse.core.resume import PartialTransferStore, commit_partial_file
 from mesh_pulse.core.session import (
     PROTOCOL_VERSION,
     AuthenticationError,
@@ -46,16 +59,27 @@ from mesh_pulse.core.session import (
     client_handshake,
     server_handshake,
 )
+from mesh_pulse.core.transfer_protocol import (
+    TransferOffer,
+    build_response,
+    validate_offer,
+    validate_response,
+)
 from mesh_pulse.core.trust import TrustedDevice, TrustStatus, TrustStore
 from mesh_pulse.utils.config import (
     CHUNK_SIZE,
+    CHUNK_TIMEOUT,
+    CONNECT_TIMEOUT,
+    HANDSHAKE_TIMEOUT,
     HEADER_MAX_SIZE,
+    IDLE_TRANSFER_TIMEOUT,
     MAX_FILE_SIZE,
     MAX_FILES_PER_SESSION,
     MAX_RETRIES,
     MAX_SESSION_SIZE,
     RECEIVE_DIR,
     RETRY_DELAYS,
+    TRANSFER_APPROVAL_TIMEOUT,
     TRANSFER_BACKLOG,
     TRANSFER_PORT,
 )
@@ -81,9 +105,15 @@ class TransferDirection(Enum):
 
 class TransferStatus(Enum):
     PENDING = "pending"
+    PENDING_APPROVAL = "pending_approval"
+    ACCEPTED = "accepted"
+    REJECTED = "rejected"
     ACTIVE = "active"
+    INTERRUPTED = "interrupted"
+    RESUMING = "resuming"
     COMPLETE = "complete"
     FAILED = "failed"
+    CANCELLED = "cancelled"
 
 
 @dataclass
@@ -100,6 +130,14 @@ class TransferInfo:
     error: str | None = None
     retry_count: int = 0
     peer_device_id: str | None = None
+    transfer_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    file_id: str | None = None
+    resume_offset: int = 0
+    bytes_transferred_this_attempt: int = 0
+    completed_at: float | None = None
+    message: str | None = None
+    sha256: str | None = None
+    final_path: str | None = None
 
     @property
     def progress(self) -> float:
@@ -130,7 +168,21 @@ class TransferInfo:
             "speed_mbps": round(self.speed_mbps, 2),
             "retry_count": self.retry_count,
             "peer_device_id": self.peer_device_id,
+            "transfer_id": self.transfer_id,
+            "resume_offset": self.resume_offset,
         }
+
+
+class TransferRejected(ProtocolError):
+    """The authenticated peer explicitly declined a transfer offer."""
+
+
+class ApprovalTimeout(ProtocolError):
+    """The peer did not decide on a transfer offer in time."""
+
+
+class TransferCancelled(ConnectionError):
+    """A user deliberately cancelled an active transfer."""
 
 
 # ─── Internal helpers ────────────────────────────────────────────────
@@ -277,11 +329,15 @@ class FileServer(threading.Thread):
         identity: DeviceIdentity | None = None,
         trust_store: TrustStore | None = None,
         legacy_mode: bool | None = None,
+        incoming_manager: IncomingRequestManager | None = None,
+        peer_name_resolver: Callable[[str], str | None] | None = None,
+        approval_timeout: float = TRANSFER_APPROVAL_TIMEOUT,
     ):
         super().__init__(daemon=True, name="file-server")
         self._port = port
         self._receive_dir = Path(receive_dir)
         self._receive_dir.mkdir(parents=True, exist_ok=True)
+        self._partials = PartialTransferStore(self._receive_dir)
         self._key = (
             derive_session_key(passphrase) if passphrase else derive_session_key("")
         )
@@ -296,6 +352,9 @@ class FileServer(threading.Thread):
             raise ValueError("Trusted protocol mode requires identity and trust store")
         self._on_update = on_transfer_update
         self._on_file_received = on_file_received
+        self._incoming_manager = incoming_manager
+        self._peer_name_resolver = peer_name_resolver
+        self._approval_timeout = approval_timeout
         self._running = threading.Event()
         self._running.set()
         self._server_socket: socket.socket | None = None
@@ -312,7 +371,10 @@ class FileServer(threading.Thread):
             self._server_socket.bind(("", self._port))
             self._server_socket.listen(TRANSFER_BACKLOG)
         except OSError as e:
-            log.error("Cannot bind TCP server on port %d: %s", self._port, e)
+            if self._running.is_set():
+                log.error("Cannot bind TCP server on port %d: %s", self._port, e)
+            else:
+                log.debug("Transfer server stopped during startup: %s", e)
             return
 
         log.info("FileServer listening on port %d", self._port)
@@ -358,38 +420,71 @@ class FileServer(threading.Thread):
                 session_key = self._key
                 peer_device_id = None
                 expected_version = 2
+                session = _recv_frame_json(conn, session_key)
+                count, message = _validate_session_header(session, expected_version)
+                if message:
+                    log.info("Message from %s: %s", peer_ip, message)
+                session_size = 0
+                for _ in range(count):
+                    ctrl = _recv_frame_json(conn, session_key)
+                    if ctrl.get("type") == "fin":
+                        break
+                    _, filesize, _ = _validate_file_header(ctrl)
+                    session_size += filesize
+                    if session_size > MAX_SESSION_SIZE:
+                        raise ProtocolError("Transfer session exceeds size limit")
+                    self._receive_one_file(
+                        conn,
+                        peer_ip,
+                        ctrl,
+                        session_key,
+                        peer_device_id,
+                    )
+                return
+
+            conn.settimeout(HANDSHAKE_TIMEOUT)
+            authenticated = server_handshake(
+                conn,
+                self._identity,
+                self._trust_store,
+            )
+            session_key = authenticated.key
+            peer_device_id = authenticated.peer_device_id
+            offer = validate_offer(_recv_frame_json(conn, session_key))
+            request = IncomingTransferRequest(
+                transfer_id=offer.transfer_id,
+                peer_device_id=peer_device_id,
+                peer_ip=peer_ip,
+                peer_name=(
+                    self._peer_name_resolver(peer_device_id)
+                    if self._peer_name_resolver is not None
+                    else None
+                ),
+                files=offer.files,
+                total_size=offer.total_size,
+                message=offer.message,
+                received_at=time.time(),
+            )
+            if self._incoming_manager is None:
+                decision = IncomingRequestStatus.ACCEPTED
+                reason = None
             else:
-                authenticated = server_handshake(
-                    conn,
-                    self._identity,
-                    self._trust_store,
+                self._incoming_manager.publish(request)
+                decided = self._await_incoming_decision(
+                    conn, session_key, offer.transfer_id
                 )
-                session_key = authenticated.key
-                peer_device_id = authenticated.peer_device_id
-                expected_version = PROTOCOL_VERSION
-
-            session = _recv_frame_json(conn, session_key)
-            count, message = _validate_session_header(session, expected_version)
-            if message:
-                log.info("Message from %s: %s", peer_ip, message)
-
-            # ── Receive each file ──
-            session_size = 0
-            for _ in range(count):
-                ctrl = _recv_frame_json(conn, session_key)
-                if ctrl.get("type") == "fin":
-                    break
-                _, filesize, _ = _validate_file_header(ctrl)
-                session_size += filesize
-                if session_size > MAX_SESSION_SIZE:
-                    raise ProtocolError("Transfer session exceeds size limit")
-                self._receive_one_file(
-                    conn,
-                    peer_ip,
-                    ctrl,
-                    session_key,
-                    peer_device_id,
-                )
+                decision = decided.status
+                reason = decided.reason
+            accepted = decision == IncomingRequestStatus.ACCEPTED
+            _send_frame(
+                conn,
+                session_key,
+                build_response(offer.transfer_id, accepted, reason),
+            )
+            if not accepted:
+                return
+            conn.settimeout(IDLE_TRANSFER_TIMEOUT)
+            self._receive_v3_session(conn, peer_ip, peer_device_id, session_key, offer)
 
         except (AuthenticationError, ProtocolError, InvalidTag) as e:
             log.warning("Rejected transfer session from %s: %s", peer_ip, e)
@@ -397,6 +492,225 @@ class FileServer(threading.Thread):
             log.error("Session error from %s: %s", peer_ip, e)
         finally:
             conn.close()
+
+    def _await_incoming_decision(
+        self, conn: socket.socket, session_key: bytes, transfer_id: str
+    ) -> IncomingTransferRequest:
+        """Wait for UI input while also honoring an authenticated peer cancel."""
+        deadline = time.monotonic() + self._approval_timeout
+        while time.monotonic() < deadline:
+            request = self._incoming_manager.get_request(transfer_id)
+            if (
+                request is not None
+                and request.status != IncomingRequestStatus.PENDING_APPROVAL
+            ):
+                return request
+            remaining = deadline - time.monotonic()
+            readable, _, _ = select.select([conn], [], [], min(0.25, remaining))
+            if readable:
+                try:
+                    control = _recv_frame_json(conn, session_key)
+                except (ConnectionError, OSError):
+                    self._incoming_manager.cancel_request(
+                        transfer_id, "Peer disconnected"
+                    )
+                    raise
+                if control != {"type": "cancel", "transfer_id": transfer_id}:
+                    self._incoming_manager.reject_request(
+                        transfer_id, "Invalid transfer protocol"
+                    )
+                    raise ProtocolError("File payload sent before approval")
+                self._incoming_manager.cancel_request(transfer_id, "Cancelled by peer")
+        return self._incoming_manager.wait_for_decision(transfer_id, 0)
+
+    def _receive_v3_session(
+        self,
+        conn: socket.socket,
+        peer_ip: str,
+        peer_device_id: str,
+        session_key: bytes,
+        offer: TransferOffer,
+    ) -> None:
+        """Resume and receive a validated v3 offer into hidden partial files."""
+        query = _recv_frame_json(conn, session_key)
+        self._partials.validate_resume_query(query, offer)
+        states = self._partials.prepare(offer)
+        _send_frame(
+            conn,
+            session_key,
+            {
+                "type": "resume_state",
+                "transfer_id": offer.transfer_id,
+                "files": [
+                    {"file_id": item.file_id, "offset": states[item.file_id].offset}
+                    for item in offer.files
+                ],
+            },
+        )
+
+        for offered in offer.files:
+            control = _recv_frame_json(conn, session_key)
+            if control.get("type") == "cancel":
+                raise TransferCancelled("Transfer cancelled by peer")
+            if (
+                control.get("type") != "file_start"
+                or control.get("transfer_id") != offer.transfer_id
+                or control.get("file_id") != offered.file_id
+            ):
+                raise ProtocolError("Invalid file start")
+            state = states[offered.file_id]
+            info = TransferInfo(
+                filename=offered.name,
+                filesize=offered.size,
+                direction=TransferDirection.RECV,
+                peer_ip=peer_ip,
+                status=(
+                    TransferStatus.RESUMING if state.offset else TransferStatus.ACTIVE
+                ),
+                bytes_transferred=state.offset,
+                peer_device_id=peer_device_id,
+                transfer_id=offer.transfer_id,
+                file_id=offered.file_id,
+                resume_offset=state.offset,
+                message=offer.message,
+                sha256=offered.sha256,
+            )
+            self._register_transfer(info)
+            try:
+                if state.final_path is None:
+                    self._receive_v3_file_data(
+                        conn, session_key, offer, offered, state.partial_path, info
+                    )
+                    actual_hash = _sha256_of_file(state.partial_path)
+                    if actual_hash != offered.sha256:
+                        _send_frame(
+                            conn,
+                            session_key,
+                            {
+                                "type": "file_result",
+                                "transfer_id": offer.transfer_id,
+                                "file_id": offered.file_id,
+                                "ok": False,
+                                "reason": "SHA-256 verification failed",
+                            },
+                        )
+                        raise ProtocolError("SHA-256 verification failed")
+                    final_path = commit_partial_file(
+                        state.partial_path, self._receive_dir, offered.name
+                    )
+                    self._partials.mark_completed(offer, offered.file_id, final_path)
+                else:
+                    final_path = state.final_path
+                    self._expect_file_end(conn, session_key, offer, offered.file_id)
+
+                info.bytes_transferred = offered.size
+                info.final_path = str(final_path)
+                info.status = TransferStatus.COMPLETE
+                info.completed_at = time.time()
+                _send_frame(
+                    conn,
+                    session_key,
+                    {
+                        "type": "file_result",
+                        "transfer_id": offer.transfer_id,
+                        "file_id": offered.file_id,
+                        "ok": True,
+                        "name": final_path.name,
+                    },
+                )
+                self._notify()
+                if self._on_file_received:
+                    try:
+                        self._on_file_received(info)
+                    except (RuntimeError, TypeError, ValueError):
+                        log.exception("File-received callback failed")
+            except TransferCancelled as error:
+                info.status = TransferStatus.CANCELLED
+                info.error = str(error)
+                info.completed_at = time.time()
+                self._notify()
+                return
+            except (ProtocolError, InvalidTag, ValueError) as error:
+                info.status = TransferStatus.FAILED
+                info.error = str(error)
+                info.completed_at = time.time()
+                self._notify()
+                raise
+            except (ConnectionError, OSError, TimeoutError):
+                info.status = TransferStatus.INTERRUPTED
+                info.error = "Connection interrupted"
+                self._notify()
+                raise
+
+        final = _recv_frame_json(conn, session_key)
+        if final != {"type": "fin", "transfer_id": offer.transfer_id}:
+            raise ProtocolError("Invalid session finish")
+        _send_frame(
+            conn,
+            session_key,
+            {"type": "session_complete", "transfer_id": offer.transfer_id},
+        )
+        self._partials.complete_session(offer.transfer_id)
+
+    def _receive_v3_file_data(
+        self,
+        conn: socket.socket,
+        session_key: bytes,
+        offer: TransferOffer,
+        offered,
+        partial_path: Path,
+        info: TransferInfo,
+    ) -> None:
+        partial_path.parent.mkdir(parents=True, exist_ok=True)
+        mode = "r+b" if partial_path.exists() else "wb"
+        with open(partial_path, mode) as file_handle:
+            file_handle.seek(info.bytes_transferred)
+            index = info.bytes_transferred // CHUNK_SIZE
+            while info.bytes_transferred < offered.size:
+                control = _recv_frame_json(conn, session_key)
+                if control.get("type") == "cancel":
+                    if control.get("transfer_id") != offer.transfer_id:
+                        raise ProtocolError("Cancel transfer ID mismatch")
+                    raise TransferCancelled("Transfer cancelled by peer")
+                remaining = offered.size - info.bytes_transferred
+                declared_size = control.get("size")
+                if (
+                    control.get("type") != "chunk"
+                    or control.get("transfer_id") != offer.transfer_id
+                    or control.get("file_id") != offered.file_id
+                    or control.get("index") != index
+                    or control.get("offset") != info.bytes_transferred
+                    or isinstance(declared_size, bool)
+                    or not isinstance(declared_size, int)
+                    or not 0 < declared_size <= min(CHUNK_SIZE, remaining)
+                ):
+                    raise ProtocolError("Invalid chunk metadata")
+                conn.settimeout(CHUNK_TIMEOUT)
+                plaintext = _recv_frame_bytes(conn, session_key)
+                conn.settimeout(IDLE_TRANSFER_TIMEOUT)
+                if len(plaintext) != declared_size:
+                    raise ProtocolError("Chunk length mismatch")
+                file_handle.write(plaintext)
+                info.bytes_transferred += len(plaintext)
+                info.bytes_transferred_this_attempt += len(plaintext)
+                index += 1
+                self._notify()
+        self._expect_file_end(conn, session_key, offer, offered.file_id)
+
+    @staticmethod
+    def _expect_file_end(
+        conn: socket.socket,
+        session_key: bytes,
+        offer: TransferOffer,
+        file_id: str,
+    ) -> None:
+        control = _recv_frame_json(conn, session_key)
+        if control != {
+            "type": "file_end",
+            "transfer_id": offer.transfer_id,
+            "file_id": file_id,
+        }:
+            raise ProtocolError("Invalid file finish")
 
     def _receive_one_file(
         self,
@@ -517,6 +831,7 @@ class FileClient:
         trust_store: TrustStore | None = None,
         peer_resolver: Callable[[str], object | None] | None = None,
         legacy_mode: bool | None = None,
+        approval_timeout: float = TRANSFER_APPROVAL_TIMEOUT,
     ):
         self._port = port
         self._key = (
@@ -534,8 +849,10 @@ class FileClient:
             raise ValueError("Trusted protocol mode requires identity and trust store")
         self._on_update = on_transfer_update
         self._on_progress = on_progress
+        self._approval_timeout = approval_timeout
         self._transfers: list[TransferInfo] = []
         self._lock = threading.Lock()
+        self._cancel_events: dict[str, threading.Event] = {}
 
     # ── Public API ──────────────────────────────────────────────────
 
@@ -544,16 +861,16 @@ class FileClient:
         peer_ip: str,
         filepath: str,
         message: str | None = None,
-    ) -> None:
+    ) -> str:
         """Send a single file to a peer in a background thread."""
-        self.send_batch(peer_ip, [filepath], message=message)
+        return self.send_batch(peer_ip, [filepath], message=message)
 
     def send_batch(
         self,
         peer_ip: str,
         filepaths: list[str],
         message: str | None = None,
-    ) -> None:
+    ) -> str:
         """Send a batch of files to a peer in a single TCP session.
 
         Args:
@@ -561,13 +878,27 @@ class FileClient:
             filepaths: List of file paths to send.
             message: Optional text message (sent in session header).
         """
+        transfer_id = uuid.uuid4().hex
+        cancel_event = threading.Event()
+        with self._lock:
+            self._cancel_events[transfer_id] = cancel_event
         thread = threading.Thread(
-            target=self._batch_worker,
-            args=(peer_ip, filepaths, message),
+            target=self._batch_worker_entry,
+            args=(peer_ip, filepaths, message, transfer_id, cancel_event),
             daemon=True,
             name=f"send-batch-{peer_ip}",
         )
         thread.start()
+        return transfer_id
+
+    def cancel_transfer(self, transfer_id: str) -> bool:
+        """Cooperatively cancel a queued, approval-waiting, or active send."""
+        with self._lock:
+            event = self._cancel_events.get(transfer_id)
+        if event is None:
+            return False
+        event.set()
+        return True
 
     # Legacy single-file compat (kept so existing callers don't break)
     def send_multiple(
@@ -617,8 +948,27 @@ class FileClient:
 
     # ── Workers ─────────────────────────────────────────────────────
 
+    def _batch_worker_entry(
+        self,
+        peer_ip: str,
+        filepaths: list[str],
+        message: str | None,
+        transfer_id: str,
+        cancel_event: threading.Event,
+    ) -> None:
+        try:
+            self._batch_worker(peer_ip, filepaths, message, transfer_id, cancel_event)
+        finally:
+            with self._lock:
+                self._cancel_events.pop(transfer_id, None)
+
     def _batch_worker(
-        self, peer_ip: str, filepaths: list[str], message: str | None
+        self,
+        peer_ip: str,
+        filepaths: list[str],
+        message: str | None,
+        transfer_id: str,
+        cancel_event: threading.Event,
     ) -> None:
         """Open one TCP session and send all files with retry on failure."""
         # Validate files exist
@@ -652,20 +1002,31 @@ class FileClient:
 
         # Create TransferInfo entries for each file
         infos: list[TransferInfo] = []
-        for p, size, _ in file_meta:
+        for index, (p, size, _) in enumerate(file_meta):
             info = TransferInfo(
                 filename=p.name,
                 filesize=size,
                 direction=TransferDirection.SEND,
                 peer_ip=peer_ip,
-                status=TransferStatus.PENDING,
+                status=(
+                    TransferStatus.PENDING
+                    if self._legacy_mode
+                    else TransferStatus.PENDING_APPROVAL
+                ),
                 peer_device_id=self._peer_device_id(peer_ip),
+                transfer_id=transfer_id,
+                file_id=f"file-{index}",
+                message=message,
+                sha256=file_meta[index][2],
             )
             self._register_transfer(info)
             infos.append(info)
 
         # ── Retry loop ──
         for attempt in range(MAX_RETRIES + 1):
+            if cancel_event.is_set():
+                self._mark_cancelled(infos)
+                return
             if attempt > 0:
                 delay = RETRY_DELAYS[min(attempt - 1, len(RETRY_DELAYS) - 1)]
                 log.info(
@@ -675,28 +1036,65 @@ class FileClient:
                     peer_ip,
                     delay,
                 )
-                time.sleep(delay)
+                if cancel_event.wait(delay):
+                    self._mark_cancelled(infos)
+                    return
                 for info in infos:
                     info.retry_count = attempt
-                    info.bytes_transferred = 0
-                    info.status = TransferStatus.ACTIVE
+                    info.status = TransferStatus.RESUMING
 
             try:
-                self._send_session(peer_ip, file_meta, infos, message)
+                self._send_session(
+                    peer_ip,
+                    file_meta,
+                    infos,
+                    message,
+                    transfer_id,
+                    cancel_event,
+                )
                 # If we get here, all files sent successfully
+                return
+            except TransferRejected as error:
+                log.info("Transfer rejected by %s: %s", peer_ip, error)
+                for info in infos:
+                    info.status = TransferStatus.REJECTED
+                    info.error = "Transfer rejected by peer."
+                    info.completed_at = time.time()
+                self._notify()
+                return
+            except ApprovalTimeout:
+                for info in infos:
+                    info.status = TransferStatus.FAILED
+                    info.error = "Peer did not respond to transfer request."
+                    info.completed_at = time.time()
+                self._notify()
+                return
+            except TransferCancelled:
+                self._mark_cancelled(infos)
                 return
             except (AuthenticationError, ProtocolError) as e:
                 log.warning("Transfer authentication failed for %s: %s", peer_ip, e)
                 for info in infos:
                     info.status = TransferStatus.FAILED
                     info.error = "Transfer rejected."
+                    info.completed_at = time.time()
                 self._notify()
                 return
             except (OSError, ConnectionError) as e:
                 log.warning("Batch send attempt %d failed: %s", attempt + 1, e)
                 for info in infos:
-                    info.status = TransferStatus.FAILED
-                    info.error = str(e)
+                    info.status = (
+                        TransferStatus.FAILED
+                        if attempt == MAX_RETRIES
+                        else TransferStatus.INTERRUPTED
+                    )
+                    info.error = (
+                        "Unable to connect to peer."
+                        if attempt == MAX_RETRIES
+                        else "Connection interrupted"
+                    )
+                    if attempt == MAX_RETRIES:
+                        info.completed_at = time.time()
                 self._notify()
                 if attempt == MAX_RETRIES:
                     log.error(
@@ -711,6 +1109,8 @@ class FileClient:
         file_meta: list[tuple[Path, int, str]],
         infos: list[TransferInfo],
         message: str | None,
+        transfer_id: str,
+        cancel_event: threading.Event,
     ) -> None:
         """Open one TCP connection and stream all files."""
 
@@ -725,7 +1125,7 @@ class FileClient:
             socket.AF_INET,
             socket.SOCK_STREAM,
         )
-        sock.settimeout(30)
+        sock.settimeout(CONNECT_TIMEOUT)
 
         try:
             sock.connect((peer_ip, self._port))
@@ -735,6 +1135,7 @@ class FileClient:
             else:
                 trusted_peer = self._resolve_trusted_peer(peer_ip)
 
+                sock.settimeout(HANDSHAKE_TIMEOUT)
                 authenticated = client_handshake(
                     sock,
                     self._identity,
@@ -743,7 +1144,48 @@ class FileClient:
 
                 session_key = authenticated.key
 
-            # ── Session header ──
+                offer_frame = {
+                    "type": "transfer_offer",
+                    "version": PROTOCOL_VERSION,
+                    "transfer_id": transfer_id,
+                    "count": len(file_meta),
+                    "total_size": sum(size for _, size, _ in file_meta),
+                    "files": [
+                        {
+                            "file_id": info.file_id,
+                            "name": path.name,
+                            "size": size,
+                            "sha256": sha,
+                        }
+                        for (path, size, sha), info in zip(file_meta, infos)
+                    ],
+                }
+                if message:
+                    offer_frame["message"] = message
+                _send_frame(sock, session_key, offer_frame)
+                response = self._wait_for_approval(
+                    sock, session_key, transfer_id, cancel_event
+                )
+                accepted, reason = validate_response(response, transfer_id)
+                if not accepted:
+                    if reason == "Transfer request expired":
+                        raise ApprovalTimeout(reason)
+                    raise TransferRejected(reason or "Rejected by user")
+                for info in infos:
+                    info.status = TransferStatus.ACCEPTED
+                self._notify()
+                sock.settimeout(IDLE_TRANSFER_TIMEOUT)
+                self._send_v3_payload(
+                    sock,
+                    session_key,
+                    validate_offer(offer_frame),
+                    file_meta,
+                    infos,
+                    cancel_event,
+                )
+                return
+
+            # Compatibility-only protocol-v2 framing.
             session_frame: dict = {
                 "type": "session",
                 "version": protocol_version,
@@ -789,6 +1231,7 @@ class FileClient:
                         self._notify()
 
                 info.status = TransferStatus.COMPLETE
+                info.completed_at = time.time()
                 log.info(
                     "Sent %s to %s (%.2f MB/s)", path.name, peer_ip, info.speed_mbps
                 )
@@ -799,6 +1242,158 @@ class FileClient:
 
         finally:
             sock.close()
+
+    def _wait_for_approval(
+        self,
+        sock: socket.socket,
+        session_key: bytes,
+        transfer_id: str,
+        cancel_event: threading.Event,
+    ) -> dict:
+        """Wait responsively so cancellation and approval expiry remain bounded."""
+        deadline = time.monotonic() + self._approval_timeout
+        sock.settimeout(min(0.25, self._approval_timeout))
+        while time.monotonic() < deadline:
+            if cancel_event.is_set():
+                _send_frame(
+                    sock,
+                    session_key,
+                    {"type": "cancel", "transfer_id": transfer_id},
+                )
+                raise TransferCancelled("Transfer cancelled")
+            try:
+                return _recv_frame_json(sock, session_key)
+            except TimeoutError:
+                continue
+        raise ApprovalTimeout("Peer did not respond to transfer request")
+
+    def _send_v3_payload(
+        self,
+        sock: socket.socket,
+        session_key: bytes,
+        offer: TransferOffer,
+        file_meta: list[tuple[Path, int, str]],
+        infos: list[TransferInfo],
+        cancel_event: threading.Event,
+    ) -> None:
+        """Negotiate resume offsets and stream explicitly numbered v3 chunks."""
+        file_descriptions = [
+            {
+                "file_id": offered.file_id,
+                "name": offered.name,
+                "size": offered.size,
+                "sha256": offered.sha256,
+            }
+            for offered in offer.files
+        ]
+        _send_frame(
+            sock,
+            session_key,
+            {
+                "type": "resume_query",
+                "transfer_id": offer.transfer_id,
+                "files": file_descriptions,
+            },
+        )
+        offsets = PartialTransferStore.validate_resume_state(
+            _recv_frame_json(sock, session_key), offer
+        )
+
+        for (path, size, _sha), info, offered in zip(file_meta, infos, offer.files):
+            offset = offsets[offered.file_id]
+            info.resume_offset = offset
+            info.bytes_transferred = offset
+            info.bytes_transferred_this_attempt = 0
+            info.status = TransferStatus.RESUMING if offset else TransferStatus.ACTIVE
+            self._notify()
+            _send_frame(
+                sock,
+                session_key,
+                {
+                    "type": "file_start",
+                    "transfer_id": offer.transfer_id,
+                    "file_id": offered.file_id,
+                },
+            )
+            with open(path, "rb") as file_handle:
+                file_handle.seek(offset)
+                index = offset // CHUNK_SIZE
+                while info.bytes_transferred < size:
+                    if cancel_event.is_set():
+                        _send_frame(
+                            sock,
+                            session_key,
+                            {"type": "cancel", "transfer_id": offer.transfer_id},
+                        )
+                        raise TransferCancelled("Transfer cancelled")
+                    raw = file_handle.read(CHUNK_SIZE)
+                    if not raw:
+                        raise ProtocolError("Source file changed during transfer")
+                    _send_frame(
+                        sock,
+                        session_key,
+                        {
+                            "type": "chunk",
+                            "transfer_id": offer.transfer_id,
+                            "file_id": offered.file_id,
+                            "index": index,
+                            "offset": info.bytes_transferred,
+                            "size": len(raw),
+                        },
+                    )
+                    _send_frame(sock, session_key, raw)
+                    info.bytes_transferred += len(raw)
+                    info.bytes_transferred_this_attempt += len(raw)
+                    index += 1
+                    self._report_progress(path, info, size)
+            _send_frame(
+                sock,
+                session_key,
+                {
+                    "type": "file_end",
+                    "transfer_id": offer.transfer_id,
+                    "file_id": offered.file_id,
+                },
+            )
+            result = _recv_frame_json(sock, session_key)
+            if (
+                result.get("type") != "file_result"
+                or result.get("transfer_id") != offer.transfer_id
+                or result.get("file_id") != offered.file_id
+                or result.get("ok") is not True
+            ):
+                raise ProtocolError("Receiver failed file verification")
+            info.status = TransferStatus.COMPLETE
+            info.completed_at = time.time()
+            self._notify()
+
+        _send_frame(
+            sock,
+            session_key,
+            {"type": "fin", "transfer_id": offer.transfer_id},
+        )
+        result = _recv_frame_json(sock, session_key)
+        if result != {
+            "type": "session_complete",
+            "transfer_id": offer.transfer_id,
+        }:
+            raise ProtocolError("Invalid session completion")
+
+    def _report_progress(self, path: Path, info: TransferInfo, size: int) -> None:
+        if self._on_progress:
+            try:
+                self._on_progress(path.name, info.bytes_transferred, size)
+            except (RuntimeError, TypeError, ValueError):
+                log.exception("Transfer progress callback failed")
+        self._notify()
+
+    def _mark_cancelled(self, infos: list[TransferInfo]) -> None:
+        for info in infos:
+            if info.status != TransferStatus.COMPLETE:
+                info.status = TransferStatus.CANCELLED
+                info.error = "Cancelled by user"
+                info.completed_at = time.time()
+        self._notify()
 
     def _peer_device_id(self, peer_ip: str) -> str | None:
         if self._peer_resolver is None:
@@ -855,33 +1450,49 @@ class SecureTransfer:
         on_transfer_update: Callable | None = None,
         on_file_received: Callable[[TransferInfo], None] | None = None,
         on_progress: Callable[[str, int, int], None] | None = None,
+        on_incoming_request: Callable[[IncomingTransferRequest], None] | None = None,
+        history_store: TransferHistoryStore | None = None,
         identity: DeviceIdentity | None = None,
         trust_store: TrustStore | None = None,
         peer_resolver: Callable[[str], object | None] | None = None,
         legacy_mode: bool | None = None,
+        approval_timeout: float = TRANSFER_APPROVAL_TIMEOUT,
     ):
         self._port = transfer_port
         self._on_update = on_transfer_update
+        self._on_incoming_request = on_incoming_request
+        self._history = history_store
+        self._history_lock = threading.RLock()
+        self._persisted_progress: dict[str, tuple[float, int, str]] = {}
+        self._peer_resolver = peer_resolver
+        self._incoming = IncomingRequestManager(
+            self._handle_incoming_request,
+            self._handle_request_decision,
+        )
 
         self._server = FileServer(
             port=transfer_port,
             receive_dir=receive_dir,
             passphrase=passphrase,
-            on_transfer_update=on_transfer_update,
+            on_transfer_update=self._handle_transfer_update,
             on_file_received=on_file_received,
             identity=identity,
             trust_store=trust_store,
             legacy_mode=legacy_mode,
+            incoming_manager=None if legacy_mode else self._incoming,
+            peer_name_resolver=self._resolve_peer_name(peer_resolver),
+            approval_timeout=approval_timeout,
         )
         self._client = FileClient(
             port=transfer_port,
             passphrase=passphrase,
-            on_transfer_update=on_transfer_update,
+            on_transfer_update=self._handle_transfer_update,
             on_progress=on_progress,
             identity=identity,
             trust_store=trust_store,
             peer_resolver=peer_resolver,
             legacy_mode=legacy_mode,
+            approval_timeout=approval_timeout,
         )
 
     def start_server(self) -> None:
@@ -901,7 +1512,7 @@ class SecureTransfer:
         peer_ip: str,
         filepath: str | list[str],
         message: str | None = None,
-    ) -> None:
+    ) -> str:
         """Send one or more files to a peer as a single session.
 
         Args:
@@ -910,11 +1521,205 @@ class SecureTransfer:
             message: Optional message sent in the session header.
         """
         paths = [filepath] if isinstance(filepath, str) else list(filepath)
-        self._client.send_batch(peer_ip, paths, message=message)
+        return self._client.send_batch(peer_ip, paths, message=message)
 
     def get_transfers(self) -> list[TransferInfo]:
         """Return combined transfer records from server + client."""
         return self._server.get_transfers() + self._client.get_transfers()
+
+    def get_pending_requests(self) -> list[IncomingTransferRequest]:
+        return self._incoming.get_pending_requests()
+
+    def get_incoming_request(self, transfer_id: str) -> IncomingTransferRequest | None:
+        return self._incoming.get_request(transfer_id)
+
+    def accept_request(self, transfer_id: str) -> bool:
+        return self._incoming.accept_request(transfer_id)
+
+    def reject_request(self, transfer_id: str) -> bool:
+        return self._incoming.reject_request(transfer_id)
+
+    def cancel_transfer(self, transfer_id: str) -> bool:
+        """Cooperatively cancel an outgoing transfer session."""
+        return self._client.cancel_transfer(transfer_id)
+
+    @property
+    def history_store(self) -> TransferHistoryStore | None:
+        return self._history
+
+    def _handle_incoming_request(self, request: IncomingTransferRequest) -> None:
+        if self._history is not None:
+            self._history.create_transfer(
+                TransferRecord(
+                    transfer_id=request.transfer_id,
+                    peer_device_id=request.peer_device_id,
+                    peer_ip=request.peer_ip,
+                    peer_hostname=request.peer_name,
+                    direction=TransferDirection.RECV.value,
+                    status=TransferStatus.PENDING_APPROVAL.value,
+                    message=request.message,
+                    file_count=len(request.files),
+                    total_size=request.total_size,
+                    bytes_transferred=0,
+                    started_at=request.received_at,
+                ),
+                [
+                    TransferFileRecord(
+                        id=None,
+                        transfer_id=request.transfer_id,
+                        file_id=item.file_id,
+                        filename=item.name,
+                        final_path=None,
+                        filesize=item.size,
+                        sha256=item.sha256,
+                        bytes_transferred=0,
+                        status=TransferStatus.PENDING_APPROVAL.value,
+                    )
+                    for item in request.files
+                ],
+            )
+        if self._on_incoming_request is not None:
+            self._on_incoming_request(request)
+
+    def _handle_request_decision(self, request: IncomingTransferRequest) -> None:
+        if self._history is None:
+            return
+        status = {
+            IncomingRequestStatus.ACCEPTED: TransferStatus.ACCEPTED.value,
+            IncomingRequestStatus.REJECTED: TransferStatus.REJECTED.value,
+            IncomingRequestStatus.EXPIRED: TransferStatus.FAILED.value,
+            IncomingRequestStatus.CANCELLED: TransferStatus.CANCELLED.value,
+        }.get(request.status, TransferStatus.PENDING_APPROVAL.value)
+        self._history.update_transfer(
+            request.transfer_id,
+            status=status,
+            completed_at=(
+                time.time()
+                if request.status
+                in {
+                    IncomingRequestStatus.REJECTED,
+                    IncomingRequestStatus.EXPIRED,
+                    IncomingRequestStatus.CANCELLED,
+                }
+                else None
+            ),
+            error=request.reason,
+        )
+
+    def _handle_transfer_update(self) -> None:
+        """Persist throttled progress, then fan out to the UI callback."""
+        if self._history is not None:
+            with self._history_lock:
+                self._persist_runtime_transfers()
+        if self._on_update is not None:
+            self._on_update()
+
+    def _persist_runtime_transfers(self) -> None:
+        grouped: dict[str, list[TransferInfo]] = {}
+        for info in self.get_transfers():
+            grouped.setdefault(info.transfer_id, []).append(info)
+        terminal = {
+            TransferStatus.COMPLETE,
+            TransferStatus.FAILED,
+            TransferStatus.REJECTED,
+            TransferStatus.CANCELLED,
+        }
+        now = time.monotonic()
+        for transfer_id, infos in grouped.items():
+            status = self._aggregate_status(infos)
+            existing = self._history.get_transfer(transfer_id)
+            if (
+                status == TransferStatus.COMPLETE
+                and existing is not None
+                and existing.file_count > len(infos)
+            ):
+                status = TransferStatus.ACTIVE
+            byte_count = sum(item.bytes_transferred for item in infos)
+            previous = self._persisted_progress.get(transfer_id)
+            should_flush = (
+                previous is None
+                or previous[2] != status.value
+                or status in terminal
+                or byte_count - previous[1] >= 4 * 1024 * 1024
+                or now - previous[0] >= 2.0
+            )
+            if not should_flush:
+                continue
+            peer = (
+                self._peer_resolver(infos[0].peer_ip)
+                if self._peer_resolver is not None
+                else None
+            )
+            record = TransferRecord(
+                transfer_id=transfer_id,
+                peer_device_id=infos[0].peer_device_id,
+                peer_ip=infos[0].peer_ip,
+                peer_hostname=getattr(peer, "hostname", None),
+                direction=infos[0].direction.value,
+                status=status.value,
+                message=infos[0].message,
+                file_count=max(len(infos), existing.file_count if existing else 0),
+                total_size=max(
+                    sum(item.filesize for item in infos),
+                    existing.total_size if existing else 0,
+                ),
+                bytes_transferred=byte_count,
+                started_at=min(item.started_at for item in infos),
+                completed_at=max((item.completed_at or 0 for item in infos), default=0)
+                or None,
+                error=next((item.error for item in infos if item.error), None),
+            )
+            files = [
+                TransferFileRecord(
+                    id=None,
+                    transfer_id=transfer_id,
+                    file_id=item.file_id or f"file-{index}",
+                    filename=item.filename,
+                    final_path=item.final_path,
+                    filesize=item.filesize,
+                    sha256=item.sha256,
+                    bytes_transferred=item.bytes_transferred,
+                    status=item.status.value,
+                )
+                for index, item in enumerate(infos)
+            ]
+            self._history.create_transfer(record, files)
+            self._persisted_progress[transfer_id] = (
+                now,
+                byte_count,
+                status.value,
+            )
+
+    @staticmethod
+    def _aggregate_status(infos: list[TransferInfo]) -> TransferStatus:
+        priorities = (
+            TransferStatus.FAILED,
+            TransferStatus.CANCELLED,
+            TransferStatus.REJECTED,
+            TransferStatus.INTERRUPTED,
+            TransferStatus.RESUMING,
+            TransferStatus.ACTIVE,
+            TransferStatus.ACCEPTED,
+            TransferStatus.PENDING_APPROVAL,
+            TransferStatus.PENDING,
+        )
+        for status in priorities:
+            if any(item.status == status for item in infos):
+                return status
+        return TransferStatus.COMPLETE
+
+    @staticmethod
+    def _resolve_peer_name(
+        resolver: Callable[[str], object | None] | None,
+    ) -> Callable[[str], str | None] | None:
+        if resolver is None:
+            return None
+
+        def get_name(device_id: str) -> str | None:
+            peer = resolver(device_id)
+            return getattr(peer, "hostname", None) if peer is not None else None
+
+        return get_name
 
     @property
     def file_server(self) -> FileServer:

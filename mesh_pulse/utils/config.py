@@ -76,7 +76,12 @@ MAX_FILES_PER_SESSION = 1024
 MAX_FILE_SIZE = 100 * 1024 * 1024 * 1024  # 100 GiB
 MAX_SESSION_SIZE = 1024 * 1024 * 1024 * 1024  # 1 TiB
 MAX_RETRIES = 3  # max send retry attempts
-RETRY_DELAYS = (1.0, 3.0, 8.0)  # seconds between retry attempts
+RETRY_DELAYS = (1.0, 2.0, 4.0)  # bounded exponential retry backoff
+CONNECT_TIMEOUT = 10
+HANDSHAKE_TIMEOUT = 10
+TRANSFER_APPROVAL_TIMEOUT = 120
+CHUNK_TIMEOUT = 30
+IDLE_TRANSFER_TIMEOUT = 60
 
 # ─── Monitoring ─────────────────────────────────────────────────────
 MONITOR_INTERVAL = 2  # seconds between metric snapshots

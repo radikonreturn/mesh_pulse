@@ -25,9 +25,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from mesh_pulse.core.discovery import PeerDiscovery, PeerManager
+from mesh_pulse.core.history import TransferHistoryStore
 from mesh_pulse.core.identity import DeviceIdentity
 from mesh_pulse.core.monitor import SystemMonitor
-from mesh_pulse.core.transfer import FileClient, FileServer
+from mesh_pulse.core.transfer import FileClient, FileServer, SecureTransfer
 from mesh_pulse.core.trust import TrustStore
 from mesh_pulse.utils.config import BROADCAST_PORT, TRANSFER_PORT
 from mesh_pulse.utils.logger import get_logger
@@ -46,6 +47,8 @@ class EngineHandles:
     monitor: SystemMonitor
     identity: DeviceIdentity
     trust_store: TrustStore
+    history_store: TransferHistoryStore
+    transfer: SecureTransfer
 
 
 def start_engine(
@@ -71,6 +74,7 @@ def start_engine(
     """
     identity = DeviceIdentity.load_or_create(identity_directory)
     trust_store = TrustStore(identity.directory / "trusted_devices.json")
+    history_store = TransferHistoryStore(identity.directory / "history.db")
     peer_manager = PeerManager(trust_store=trust_store)
     monitor = SystemMonitor()
 
@@ -82,19 +86,16 @@ def start_engine(
         identity=identity,
     )
 
-    file_server = FileServer(
-        port=transfer_port,
-        identity=identity,
-        trust_store=trust_store,
-        legacy_mode=False,
-    )
-    file_client = FileClient(
-        port=transfer_port,
+    transfer = SecureTransfer(
+        transfer_port=transfer_port,
         identity=identity,
         trust_store=trust_store,
         peer_resolver=peer_manager.get_peer,
         legacy_mode=False,
+        history_store=history_store,
     )
+    file_server = transfer.file_server
+    file_client = transfer.file_client
 
     # Start all threads (all are daemon=True, non-blocking)
     monitor.start()
@@ -116,6 +117,8 @@ def start_engine(
         monitor=monitor,
         identity=identity,
         trust_store=trust_store,
+        history_store=history_store,
+        transfer=transfer,
     )
 
 
