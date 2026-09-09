@@ -14,7 +14,11 @@ import pytest
 
 from mesh_pulse.core.identity import DeviceIdentity
 from mesh_pulse.core.inbox import IncomingRequestManager
-from mesh_pulse.core.resume import PartialTransferStore, resolve_destination_collision
+from mesh_pulse.core.resume import (
+    PartialTransferStore,
+    commit_partial_file,
+    resolve_destination_collision,
+)
 from mesh_pulse.core.session import AuthenticationError, ProtocolError
 from mesh_pulse.core.transfer import (
     FileClient,
@@ -387,3 +391,167 @@ def test_temporary_network_interruption_resumes(tmp_path):
         assert (receive_dir / source.name).read_bytes() == content
     finally:
         server.shutdown()
+
+
+def test_receiver_resume_reuses_logical_record_and_no_ghost(tmp_path):
+    """Test 1 & Test 3: Receiver reuses logical record on resume; no ghost active/interrupted transfer."""
+    holder: list[IncomingRequestManager] = []
+
+    def accept(request) -> None:
+        holder[0].accept_request(request.transfer_id)
+
+    manager = IncomingRequestManager(accept)
+    holder.append(manager)
+    client_id, server_id, client_store, server_store, peer = _pair(tmp_path)
+    port = _port()
+    receive_dir = tmp_path / "received"
+    server = _InterruptOnceServer(
+        port=port,
+        receive_dir=str(receive_dir),
+        identity=server_id,
+        trust_store=server_store,
+        legacy_mode=False,
+        incoming_manager=manager,
+        approval_timeout=1,
+    )
+    client = FileClient(
+        port=port,
+        identity=client_id,
+        trust_store=client_store,
+        peer_resolver=lambda _ip: peer,
+        legacy_mode=False,
+        approval_timeout=1,
+    )
+    source = tmp_path / "resume_record.bin"
+    content = os.urandom(CHUNK_SIZE * 3)
+    source.write_bytes(content)
+    server.start()
+    time.sleep(0.05)
+    try:
+        client.send("127.0.0.1", str(source))
+        client_records = _wait(client, {TransferStatus.COMPLETE}, timeout=8)
+        assert client_records[-1].status == TransferStatus.COMPLETE
+
+        # Assert receiver runtime records contain exactly one logical record for transfer_id + file_id
+        server_records = server.get_transfers()
+        assert len(server_records) == 1
+        assert server_records[0].status == TransferStatus.COMPLETE
+        assert server_records[0].resume_offset > 0
+        assert server_records[0].resume_offset == CHUNK_SIZE
+        assert server_records[0].bytes_transferred == len(content)
+        # There must be no stale receiver-side INTERRUPTED duplicate
+        assert not any(r.status == TransferStatus.INTERRUPTED for r in server_records)
+    finally:
+        server.shutdown()
+
+
+class _InterruptOnSecondFileServer(FileServer):
+    interrupted = False
+
+    def _receive_v3_file_data(
+        self, conn, session_key, offer, offered, partial_path, info
+    ) -> None:
+        if offered.name == "file2.bin" and not self.interrupted:
+            control = _recv_frame_json(conn, session_key)
+            assert control["offset"] == 0
+            data = _recv_frame_bytes(conn, session_key)
+            partial_path.parent.mkdir(parents=True, exist_ok=True)
+            partial_path.write_bytes(data)
+            info.bytes_transferred = len(data)
+            self.interrupted = True
+            conn.shutdown(socket.SHUT_RDWR)
+            conn.close()
+            raise ConnectionResetError("simulated interruption on file 2")
+        return super()._receive_v3_file_data(
+            conn, session_key, offer, offered, partial_path, info
+        )
+
+
+def test_multifile_resume_aggregation(tmp_path):
+    """Test 4: Multi-file resume aggregation preserves logical counts and byte totals."""
+    holder: list[IncomingRequestManager] = []
+
+    def accept(request) -> None:
+        holder[0].accept_request(request.transfer_id)
+
+    manager = IncomingRequestManager(accept)
+    holder.append(manager)
+    client_id, server_id, client_store, server_store, peer = _pair(tmp_path)
+    port = _port()
+    receive_dir = tmp_path / "received"
+    server = _InterruptOnSecondFileServer(
+        port=port,
+        receive_dir=str(receive_dir),
+        identity=server_id,
+        trust_store=server_store,
+        legacy_mode=False,
+        incoming_manager=manager,
+        approval_timeout=1,
+    )
+    client = FileClient(
+        port=port,
+        identity=client_id,
+        trust_store=client_store,
+        peer_resolver=lambda _ip: peer,
+        legacy_mode=False,
+        approval_timeout=1,
+    )
+    f1 = tmp_path / "file1.bin"
+    f2 = tmp_path / "file2.bin"
+    c1 = os.urandom(CHUNK_SIZE * 2)
+    c2 = os.urandom(CHUNK_SIZE * 3)
+    f1.write_bytes(c1)
+    f2.write_bytes(c2)
+
+    server.start()
+    time.sleep(0.05)
+    try:
+        client.send_batch("127.0.0.1", [str(f1), str(f2)])
+        records = _wait(client, {TransferStatus.COMPLETE}, timeout=10)
+        assert len(records) == 2
+        assert all(r.status == TransferStatus.COMPLETE for r in records)
+
+        server_records = server.get_transfers()
+        assert len(server_records) == 2
+        assert all(r.status == TransferStatus.COMPLETE for r in server_records)
+        assert sum(r.bytes_transferred for r in server_records) == len(c1) + len(c2)
+        assert not any(r.status == TransferStatus.INTERRUPTED for r in server_records)
+    finally:
+        server.shutdown()
+
+
+def test_hardlink_fallback(tmp_path, monkeypatch):
+    """Test 8: Fallback when os.link fails with a filesystem error."""
+
+    def mock_link_fail(src, dst):
+        raise OSError(18, "Invalid cross-device link")
+
+    monkeypatch.setattr(os, "link", mock_link_fail)
+
+    recv_dir = tmp_path / "received"
+    recv_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. Verified file still completes
+    partial = tmp_path / "file.part"
+    content = b"fallback content verified"
+    partial.write_bytes(content)
+
+    dest1 = commit_partial_file(partial, recv_dir, "doc.txt")
+    assert dest1.read_bytes() == content
+    assert dest1.name == "doc.txt"
+    assert not partial.exists()
+
+    # 2. Collision naming still works, existing file is not overwritten
+    partial2 = tmp_path / "file2.part"
+    content2 = b"second file content"
+    partial2.write_bytes(content2)
+
+    dest2 = commit_partial_file(partial2, recv_dir, "doc.txt")
+    assert dest1.read_bytes() == content
+    assert dest2.read_bytes() == content2
+    assert dest2.name == "doc (1).txt"
+    assert not partial2.exists()
+
+    # 3. No temporary incomplete files remain
+    temp_files = list(recv_dir.glob(".tmp-commit-*"))
+    assert len(temp_files) == 0

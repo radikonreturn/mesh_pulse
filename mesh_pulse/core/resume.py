@@ -7,11 +7,15 @@ import json
 import os
 import shutil
 import threading
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
 from mesh_pulse.core.session import ProtocolError
 from mesh_pulse.core.transfer_protocol import TransferOffer
+from mesh_pulse.utils.logger import get_logger
+
+log = get_logger(__name__)
 
 
 def resolve_destination_collision(receive_dir: str | Path, filename: str) -> Path:
@@ -42,10 +46,47 @@ def commit_partial_file(
         destination = resolve_destination_collision(directory, filename)
         try:
             os.link(partial_path, destination)
+            partial_path.unlink(missing_ok=True)
+            return destination
         except FileExistsError:
             continue
-        partial_path.unlink()
+        except (OSError, AttributeError) as link_error:
+            # Fallback for filesystems that do not support hard links (EXDEV, EPERM, ENOTSUP, etc.)
+            log.debug(
+                "os.link failed (%s); falling back to safe copy-rename", link_error
+            )
+            break
+
+    # Fallback path: copy verified partial to temporary file inside receive_dir, then atomic rename
+    temp_path = directory / f".tmp-commit-{uuid.uuid4().hex}"
+    try:
+        with open(partial_path, "rb") as src, open(temp_path, "wb") as dst:
+            shutil.copyfileobj(src, dst, length=65536)
+            dst.flush()
+            os.fsync(dst.fileno())
+
+        while True:
+            destination = resolve_destination_collision(directory, filename)
+            try:
+                if os.name == "nt":
+                    try:
+                        os.rename(temp_path, destination)
+                        break
+                    except FileExistsError:
+                        continue
+
+                if destination.exists():
+                    continue
+                os.replace(temp_path, destination)
+                break
+            except FileExistsError:
+                continue
+
+        partial_path.unlink(missing_ok=True)
         return destination
+    finally:
+        if temp_path.exists():
+            temp_path.unlink(missing_ok=True)
 
 
 @dataclass(frozen=True)

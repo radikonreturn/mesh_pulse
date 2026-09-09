@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import socket
 import sqlite3
 import time
@@ -15,7 +16,13 @@ from mesh_pulse.core.history import (
     TransferRecord,
 )
 from mesh_pulse.core.identity import DeviceIdentity
-from mesh_pulse.core.transfer import SecureTransfer, TransferStatus
+from mesh_pulse.core.transfer import (
+    FileServer,
+    SecureTransfer,
+    TransferStatus,
+    _recv_frame_bytes,
+    _recv_frame_json,
+)
 from mesh_pulse.core.trust import TrustStatus, TrustStore
 
 
@@ -249,3 +256,327 @@ def test_cancel_status_is_persisted(tmp_path):
             break
         time.sleep(0.01)
     assert history.get_transfer(transfer_id).status == "cancelled"
+
+
+class _HistoryInterruptOnceServer(FileServer):
+    interrupted = False
+
+    def _receive_v3_file_data(
+        self, conn, session_key, offer, offered, partial_path, info
+    ) -> None:
+        if self.interrupted:
+            return super()._receive_v3_file_data(
+                conn, session_key, offer, offered, partial_path, info
+            )
+        control = _recv_frame_json(conn, session_key)
+        assert control["offset"] == 0
+        data = _recv_frame_bytes(conn, session_key)
+        partial_path.parent.mkdir(parents=True, exist_ok=True)
+        partial_path.write_bytes(data)
+        info.bytes_transferred = len(data)
+        self.interrupted = True
+        conn.shutdown(socket.SHUT_RDWR)
+        conn.close()
+        raise ConnectionResetError("simulated interruption")
+
+
+def test_receiver_persistent_history_after_resume(tmp_path):
+    """Test 2: Receiver persistent history shows COMPLETE, not INTERRUPTED, no byte/count duplication."""
+    port_socket = socket.socket()
+    port_socket.bind(("127.0.0.1", 0))
+    port = port_socket.getsockname()[1]
+    port_socket.close()
+
+    client_identity = DeviceIdentity.load_or_create(tmp_path / "client")
+    server_identity = DeviceIdentity.load_or_create(tmp_path / "server")
+    client_trust = TrustStore(tmp_path / "client-trust.json")
+    server_trust = TrustStore(tmp_path / "server-trust.json")
+    client_trust.trust(server_identity.device_id, "server", server_identity.public_key)
+    server_trust.trust(client_identity.device_id, "client", client_identity.public_key)
+
+    peer = SimpleNamespace(
+        device_id=server_identity.device_id,
+        public_key=server_identity.public_key,
+        trust_status=TrustStatus.TRUSTED,
+        protocol_version=3,
+        hostname="server",
+    )
+    server_history = TransferHistoryStore(tmp_path / "server-history.db")
+    client_history = TransferHistoryStore(tmp_path / "client-history.db")
+    server_holder = []
+
+    def approve(request) -> None:
+        server_holder[0].accept_request(request.transfer_id)
+
+    server = SecureTransfer(
+        transfer_port=port,
+        receive_dir=str(tmp_path / "received"),
+        identity=server_identity,
+        trust_store=server_trust,
+        legacy_mode=False,
+        history_store=server_history,
+        on_incoming_request=approve,
+    )
+    server_holder.append(server)
+
+    # Swap in the interrupting server
+    server._server = _HistoryInterruptOnceServer(
+        port=port,
+        receive_dir=str(tmp_path / "received"),
+        identity=server_identity,
+        trust_store=server_trust,
+        legacy_mode=False,
+        incoming_manager=server._incoming,
+        on_transfer_update=server._handle_transfer_update,
+        approval_timeout=5,
+    )
+
+    client = SecureTransfer(
+        transfer_port=port,
+        identity=client_identity,
+        trust_store=client_trust,
+        peer_resolver=lambda _peer: peer,
+        legacy_mode=False,
+        history_store=client_history,
+    )
+
+    source = tmp_path / "resume_history.bin"
+    content = os.urandom(64 * 1024 * 3)
+    source.write_bytes(content)
+
+    server.start_server()
+    time.sleep(0.05)
+    try:
+        transfer_id = client.send_file("127.0.0.1", str(source))
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            record = server_history.get_transfer(transfer_id)
+            if record and record.status == "complete":
+                break
+            time.sleep(0.05)
+
+        # Force a flush of runtime transfers to history if not yet flushed
+        server._handle_transfer_update()
+
+        record = server_history.get_transfer(transfer_id)
+        assert record is not None
+        assert record.status == "complete"
+        assert record.bytes_transferred == len(content)
+        assert record.file_count == 1
+        assert record.total_size == len(content)
+
+        files = server_history.get_files(transfer_id)
+        assert len(files) == 1
+        assert files[0].status == "complete"
+        assert files[0].bytes_transferred == len(content)
+    finally:
+        server.stop_server()
+
+
+def test_rejected_child_history(tmp_path):
+    """Test 5: When request is rejected, parent is REJECTED and all child files are REJECTED."""
+    port_socket = socket.socket()
+    port_socket.bind(("127.0.0.1", 0))
+    port = port_socket.getsockname()[1]
+    port_socket.close()
+
+    client_identity = DeviceIdentity.load_or_create(tmp_path / "client")
+    server_identity = DeviceIdentity.load_or_create(tmp_path / "server")
+    client_trust = TrustStore(tmp_path / "client-trust.json")
+    server_trust = TrustStore(tmp_path / "server-trust.json")
+    client_trust.trust(server_identity.device_id, "server", server_identity.public_key)
+    server_trust.trust(client_identity.device_id, "client", client_identity.public_key)
+
+    peer = SimpleNamespace(
+        device_id=server_identity.device_id,
+        public_key=server_identity.public_key,
+        trust_status=TrustStatus.TRUSTED,
+        protocol_version=3,
+        hostname="server",
+    )
+    server_history = TransferHistoryStore(tmp_path / "server-history.db")
+    server_holder = []
+
+    def reject(request) -> None:
+        server_holder[0].reject_request(request.transfer_id)
+
+    server = SecureTransfer(
+        transfer_port=port,
+        receive_dir=str(tmp_path / "received"),
+        identity=server_identity,
+        trust_store=server_trust,
+        legacy_mode=False,
+        history_store=server_history,
+        on_incoming_request=reject,
+    )
+    server_holder.append(server)
+
+    client = SecureTransfer(
+        transfer_port=port,
+        identity=client_identity,
+        trust_store=client_trust,
+        peer_resolver=lambda _peer: peer,
+        legacy_mode=False,
+    )
+
+    source = tmp_path / "rejected.bin"
+    source.write_bytes(b"content")
+
+    server.start_server()
+    time.sleep(0.05)
+    try:
+        transfer_id = client.send_file("127.0.0.1", str(source))
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            record = server_history.get_transfer(transfer_id)
+            if record and record.status == "rejected":
+                break
+            time.sleep(0.02)
+
+        record = server_history.get_transfer(transfer_id)
+        assert record is not None
+        assert record.status == "rejected"
+        files = server_history.get_files(transfer_id)
+        assert len(files) == 1
+        assert files[0].status == "rejected"
+    finally:
+        server.stop_server()
+
+
+def test_expired_child_history(tmp_path):
+    """Test 6: When request expires, parent is FAILED with reason and all children are FAILED."""
+    port_socket = socket.socket()
+    port_socket.bind(("127.0.0.1", 0))
+    port = port_socket.getsockname()[1]
+    port_socket.close()
+
+    client_identity = DeviceIdentity.load_or_create(tmp_path / "client")
+    server_identity = DeviceIdentity.load_or_create(tmp_path / "server")
+    client_trust = TrustStore(tmp_path / "client-trust.json")
+    server_trust = TrustStore(tmp_path / "server-trust.json")
+    client_trust.trust(server_identity.device_id, "server", server_identity.public_key)
+    server_trust.trust(client_identity.device_id, "client", client_identity.public_key)
+
+    peer = SimpleNamespace(
+        device_id=server_identity.device_id,
+        public_key=server_identity.public_key,
+        trust_status=TrustStatus.TRUSTED,
+        protocol_version=3,
+        hostname="server",
+    )
+    server_history = TransferHistoryStore(tmp_path / "server-history.db")
+
+    # Set approval_timeout very short to expire quickly
+    server = SecureTransfer(
+        transfer_port=port,
+        receive_dir=str(tmp_path / "received"),
+        identity=server_identity,
+        trust_store=server_trust,
+        legacy_mode=False,
+        history_store=server_history,
+        on_incoming_request=lambda _req: None,
+        approval_timeout=0.2,
+    )
+
+    client = SecureTransfer(
+        transfer_port=port,
+        identity=client_identity,
+        trust_store=client_trust,
+        peer_resolver=lambda _peer: peer,
+        legacy_mode=False,
+        approval_timeout=5.0,
+    )
+
+    source = tmp_path / "expired.bin"
+    source.write_bytes(b"content")
+
+    server.start_server()
+    time.sleep(0.05)
+    try:
+        transfer_id = client.send_file("127.0.0.1", str(source))
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            record = server_history.get_transfer(transfer_id)
+            if record and record.status == "failed":
+                break
+            time.sleep(0.02)
+
+        record = server_history.get_transfer(transfer_id)
+        assert record is not None
+        assert record.status == "failed"
+        assert record.error == "Transfer request expired"
+        files = server_history.get_files(transfer_id)
+        assert len(files) == 1
+        assert files[0].status == "failed"
+    finally:
+        server.stop_server()
+
+
+def test_cancelled_child_history(tmp_path):
+    """Test 7: When request is cancelled, parent is CANCELLED and all children are CANCELLED."""
+    port_socket = socket.socket()
+    port_socket.bind(("127.0.0.1", 0))
+    port = port_socket.getsockname()[1]
+    port_socket.close()
+
+    client_identity = DeviceIdentity.load_or_create(tmp_path / "client")
+    server_identity = DeviceIdentity.load_or_create(tmp_path / "server")
+    client_trust = TrustStore(tmp_path / "client-trust.json")
+    server_trust = TrustStore(tmp_path / "server-trust.json")
+    client_trust.trust(server_identity.device_id, "server", server_identity.public_key)
+    server_trust.trust(client_identity.device_id, "client", client_identity.public_key)
+
+    peer = SimpleNamespace(
+        device_id=server_identity.device_id,
+        public_key=server_identity.public_key,
+        trust_status=TrustStatus.TRUSTED,
+        protocol_version=3,
+        hostname="server",
+    )
+    server_history = TransferHistoryStore(tmp_path / "server-history.db")
+    server_holder = []
+
+    def cancel_it(request) -> None:
+        server_holder[0].cancel_incoming_request(request.transfer_id, "Cancelled by user")
+
+    server = SecureTransfer(
+        transfer_port=port,
+        receive_dir=str(tmp_path / "received"),
+        identity=server_identity,
+        trust_store=server_trust,
+        legacy_mode=False,
+        history_store=server_history,
+        on_incoming_request=cancel_it,
+    )
+    server_holder.append(server)
+
+    client = SecureTransfer(
+        transfer_port=port,
+        identity=client_identity,
+        trust_store=client_trust,
+        peer_resolver=lambda _peer: peer,
+        legacy_mode=False,
+    )
+
+    source = tmp_path / "cancelled.bin"
+    source.write_bytes(b"content")
+
+    server.start_server()
+    time.sleep(0.05)
+    try:
+        transfer_id = client.send_file("127.0.0.1", str(source))
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            record = server_history.get_transfer(transfer_id)
+            if record and record.status == "cancelled":
+                break
+            time.sleep(0.02)
+
+        record = server_history.get_transfer(transfer_id)
+        assert record is not None
+        assert record.status == "cancelled"
+        files = server_history.get_files(transfer_id)
+        assert len(files) == 1
+        assert files[0].status == "cancelled"
+    finally:
+        server.stop_server()

@@ -359,7 +359,59 @@ class FileServer(threading.Thread):
         self._running.set()
         self._server_socket: socket.socket | None = None
         self._transfers: list[TransferInfo] = []
+        self._transfer_index: dict[tuple[str, str], TransferInfo] = {}
         self._lock = threading.Lock()
+
+    def _get_or_create_v3_transfer(
+        self,
+        *,
+        transfer_id: str,
+        file_id: str,
+        filename: str,
+        filesize: int,
+        peer_ip: str,
+        peer_device_id: str | None,
+        resume_offset: int,
+        message: str | None,
+        sha256: str | None,
+    ) -> TransferInfo:
+        with self._lock:
+            key = (transfer_id, file_id)
+            existing = self._transfer_index.get(key)
+            if existing is not None:
+                existing.status = (
+                    TransferStatus.RESUMING if resume_offset else TransferStatus.ACTIVE
+                )
+                existing.resume_offset = resume_offset
+                existing.bytes_transferred = resume_offset
+                existing.bytes_transferred_this_attempt = 0
+                existing.error = None
+                existing.final_path = None
+                existing.completed_at = None
+                if sha256 and not existing.sha256:
+                    existing.sha256 = sha256
+                info = existing
+            else:
+                info = TransferInfo(
+                    filename=filename,
+                    filesize=filesize,
+                    direction=TransferDirection.RECV,
+                    peer_ip=peer_ip,
+                    status=(
+                        TransferStatus.RESUMING if resume_offset else TransferStatus.ACTIVE
+                    ),
+                    bytes_transferred=resume_offset,
+                    peer_device_id=peer_device_id,
+                    transfer_id=transfer_id,
+                    file_id=file_id,
+                    resume_offset=resume_offset,
+                    message=message,
+                    sha256=sha256,
+                )
+                self._transfer_index[key] = info
+                self._transfers.append(info)
+        self._notify()
+        return info
 
     def run(self) -> None:
         """TCP accept loop: receive file sessions from peers."""
@@ -559,25 +611,20 @@ class FileServer(threading.Thread):
             ):
                 raise ProtocolError("Invalid file start")
             state = states[offered.file_id]
-            info = TransferInfo(
-                filename=offered.name,
-                filesize=offered.size,
-                direction=TransferDirection.RECV,
-                peer_ip=peer_ip,
-                status=(
-                    TransferStatus.RESUMING if state.offset else TransferStatus.ACTIVE
-                ),
-                bytes_transferred=state.offset,
-                peer_device_id=peer_device_id,
+            info = self._get_or_create_v3_transfer(
                 transfer_id=offer.transfer_id,
                 file_id=offered.file_id,
+                filename=offered.name,
+                filesize=offered.size,
+                peer_ip=peer_ip,
+                peer_device_id=peer_device_id,
                 resume_offset=state.offset,
                 message=offer.message,
                 sha256=offered.sha256,
             )
-            self._register_transfer(info)
             try:
                 if state.final_path is None:
+                    info.status = TransferStatus.ACTIVE
                     self._receive_v3_file_data(
                         conn, session_key, offer, offered, state.partial_path, info
                     )
@@ -787,6 +834,11 @@ class FileServer(threading.Thread):
 
     def _register_transfer(self, info: TransferInfo) -> None:
         with self._lock:
+            if info.transfer_id and info.file_id:
+                key = (info.transfer_id, info.file_id)
+                if key in self._transfer_index:
+                    return
+                self._transfer_index[key] = info
             self._transfers.append(info)
         self._notify()
 
@@ -1539,6 +1591,11 @@ class SecureTransfer:
     def reject_request(self, transfer_id: str) -> bool:
         return self._incoming.reject_request(transfer_id)
 
+    def cancel_incoming_request(
+        self, transfer_id: str, reason: str = "Cancelled"
+    ) -> bool:
+        return self._incoming.cancel_request(transfer_id, reason)
+
     def cancel_transfer(self, transfer_id: str) -> bool:
         """Cooperatively cancel an outgoing transfer session."""
         return self._client.cancel_transfer(transfer_id)
@@ -1590,6 +1647,9 @@ class SecureTransfer:
             IncomingRequestStatus.EXPIRED: TransferStatus.FAILED.value,
             IncomingRequestStatus.CANCELLED: TransferStatus.CANCELLED.value,
         }.get(request.status, TransferStatus.PENDING_APPROVAL.value)
+        error = request.reason
+        if request.status == IncomingRequestStatus.EXPIRED and not error:
+            error = "Transfer request expired"
         self._history.update_transfer(
             request.transfer_id,
             status=status,
@@ -1603,8 +1663,17 @@ class SecureTransfer:
                 }
                 else None
             ),
-            error=request.reason,
+            error=error,
         )
+        child_status = {
+            IncomingRequestStatus.REJECTED: TransferStatus.REJECTED.value,
+            IncomingRequestStatus.EXPIRED: TransferStatus.FAILED.value,
+            IncomingRequestStatus.CANCELLED: TransferStatus.CANCELLED.value,
+        }.get(request.status)
+        if child_status is not None:
+            self._history.update_transfer_files_status(
+                request.transfer_id, child_status
+            )
 
     def _handle_transfer_update(self) -> None:
         """Persist throttled progress, then fan out to the UI callback."""
@@ -1613,6 +1682,71 @@ class SecureTransfer:
                 self._persist_runtime_transfers()
         if self._on_update is not None:
             self._on_update()
+
+    @staticmethod
+    def _file_status_rank(status: TransferStatus) -> int:
+        ranking = {
+            TransferStatus.COMPLETE: 100,
+            TransferStatus.CANCELLED: 90,
+            TransferStatus.FAILED: 80,
+            TransferStatus.REJECTED: 70,
+            TransferStatus.ACTIVE: 60,
+            TransferStatus.RESUMING: 50,
+            TransferStatus.INTERRUPTED: 40,
+            TransferStatus.ACCEPTED: 30,
+            TransferStatus.PENDING_APPROVAL: 20,
+            TransferStatus.PENDING: 10,
+        }
+        return ranking.get(status, 0)
+
+    @classmethod
+    def _resolve_authoritative_file_info(
+        cls, items: list[TransferInfo]
+    ) -> TransferInfo:
+        if len(items) == 1:
+            return items[0]
+        best = max(
+            items,
+            key=lambda x: (
+                cls._file_status_rank(x.status),
+                x.bytes_transferred,
+                x.started_at,
+            ),
+        )
+        max_bytes = max(item.bytes_transferred for item in items)
+        if best.status == TransferStatus.COMPLETE:
+            max_bytes = best.filesize
+        completed_at = max(
+            (item.completed_at or 0 for item in items), default=0
+        ) or None
+        final_path = next(
+            (item.final_path for item in items if item.final_path), best.final_path
+        )
+        return TransferInfo(
+            filename=best.filename,
+            filesize=best.filesize,
+            direction=best.direction,
+            peer_ip=best.peer_ip,
+            status=best.status,
+            bytes_transferred=max_bytes,
+            started_at=min(item.started_at for item in items),
+            error=best.error if best.status != TransferStatus.COMPLETE else None,
+            retry_count=max(item.retry_count for item in items),
+            peer_device_id=best.peer_device_id,
+            transfer_id=best.transfer_id,
+            file_id=best.file_id,
+            resume_offset=max(item.resume_offset for item in items),
+            bytes_transferred_this_attempt=best.bytes_transferred_this_attempt,
+            completed_at=completed_at if best.status in {
+                TransferStatus.COMPLETE,
+                TransferStatus.FAILED,
+                TransferStatus.CANCELLED,
+                TransferStatus.REJECTED,
+            } else None,
+            message=best.message,
+            sha256=best.sha256,
+            final_path=final_path,
+        )
 
     def _persist_runtime_transfers(self) -> None:
         grouped: dict[str, list[TransferInfo]] = {}
@@ -1625,16 +1759,31 @@ class SecureTransfer:
             TransferStatus.CANCELLED,
         }
         now = time.monotonic()
-        for transfer_id, infos in grouped.items():
+        for transfer_id, raw_infos in grouped.items():
+            # Deduplicate by logical file: (transfer_id + file_id/filename + direction)
+            file_groups: dict[tuple[str, str], list[TransferInfo]] = {}
+            for item in raw_infos:
+                file_key = (item.file_id or item.filename, item.direction.value)
+                file_groups.setdefault(file_key, []).append(item)
+
+            infos = [
+                self._resolve_authoritative_file_info(items)
+                for items in file_groups.values()
+            ]
+
             status = self._aggregate_status(infos)
             existing = self._history.get_transfer(transfer_id)
-            if (
+            if existing is not None and existing.status == TransferStatus.COMPLETE.value:
+                status = TransferStatus.COMPLETE
+            elif (
                 status == TransferStatus.COMPLETE
                 and existing is not None
                 and existing.file_count > len(infos)
             ):
                 status = TransferStatus.ACTIVE
             byte_count = sum(item.bytes_transferred for item in infos)
+            if status == TransferStatus.COMPLETE and existing is not None:
+                byte_count = max(byte_count, existing.bytes_transferred)
             previous = self._persisted_progress.get(transfer_id)
             should_flush = (
                 previous is None
@@ -1666,8 +1815,11 @@ class SecureTransfer:
                 bytes_transferred=byte_count,
                 started_at=min(item.started_at for item in infos),
                 completed_at=max((item.completed_at or 0 for item in infos), default=0)
+                or (existing.completed_at if existing else None)
                 or None,
-                error=next((item.error for item in infos if item.error), None),
+                error=next((item.error for item in infos if item.error), None)
+                if status != TransferStatus.COMPLETE
+                else None,
             )
             files = [
                 TransferFileRecord(

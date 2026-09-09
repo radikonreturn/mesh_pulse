@@ -88,13 +88,25 @@ class TransferHistoryStore:
                         peer_ip=excluded.peer_ip,
                         peer_hostname=COALESCE(excluded.peer_hostname, peer_hostname),
                         direction=excluded.direction,
-                        status=excluded.status,
+                        status=CASE
+                            WHEN transfers.status = 'complete' AND excluded.status IN ('interrupted', 'resuming', 'active', 'pending', 'pending_approval')
+                            THEN transfers.status
+                            ELSE excluded.status
+                        END,
                         message=COALESCE(excluded.message, message),
-                        file_count=excluded.file_count,
-                        total_size=excluded.total_size,
-                        bytes_transferred=excluded.bytes_transferred,
-                        completed_at=excluded.completed_at,
-                        error=excluded.error
+                        file_count=MAX(excluded.file_count, transfers.file_count),
+                        total_size=MAX(excluded.total_size, transfers.total_size),
+                        bytes_transferred=CASE
+                            WHEN transfers.status = 'complete'
+                            THEN MAX(transfers.bytes_transferred, excluded.bytes_transferred)
+                            ELSE excluded.bytes_transferred
+                        END,
+                        completed_at=COALESCE(transfers.completed_at, excluded.completed_at),
+                        error=CASE
+                            WHEN transfers.status = 'complete' AND excluded.status IN ('interrupted', 'resuming', 'active', 'pending', 'pending_approval')
+                            THEN transfers.error
+                            ELSE excluded.error
+                        END
                     """,
                     self._transfer_values(record),
                 )
@@ -118,16 +130,35 @@ class TransferHistoryStore:
         values = {key: value for key, value in changes.items() if key in allowed}
         if not self.available or not values:
             return False
+        extra_where = ""
+        if values.get("status") in _INTERRUPTIBLE:
+            extra_where = " AND status != 'complete'"
         assignments = ", ".join(f"{key} = ?" for key in values)
         try:
             with self._lock, self._connection() as connection:
                 cursor = connection.execute(
-                    f"UPDATE transfers SET {assignments} WHERE transfer_id = ?",
+                    f"UPDATE transfers SET {assignments} WHERE transfer_id = ?{extra_where}",
                     (*values.values(), transfer_id),
                 )
                 return cursor.rowcount > 0
         except sqlite3.DatabaseError as error:
             log.error("Unable to update transfer history record: %s", error)
+            return False
+
+    def update_transfer_files_status(
+        self, transfer_id: str, status: str
+    ) -> bool:
+        if not self.available:
+            return False
+        try:
+            with self._lock, self._connection() as connection:
+                cursor = connection.execute(
+                    "UPDATE transfer_files SET status = ? WHERE transfer_id = ?",
+                    (status, transfer_id),
+                )
+                return cursor.rowcount > 0
+        except sqlite3.DatabaseError as error:
+            log.error("Unable to update transfer files status: %s", error)
             return False
 
     def add_file(self, record: TransferFileRecord) -> bool:
@@ -359,8 +390,16 @@ class TransferHistoryStore:
             ON CONFLICT(transfer_id, file_id) DO UPDATE SET
                 final_path=COALESCE(excluded.final_path, final_path),
                 sha256=COALESCE(excluded.sha256, sha256),
-                bytes_transferred=excluded.bytes_transferred,
-                status=excluded.status
+                bytes_transferred=CASE
+                    WHEN transfer_files.status = 'complete'
+                    THEN MAX(transfer_files.bytes_transferred, excluded.bytes_transferred)
+                    ELSE excluded.bytes_transferred
+                END,
+                status=CASE
+                    WHEN transfer_files.status = 'complete' AND excluded.status IN ('interrupted', 'resuming', 'active', 'pending', 'pending_approval')
+                    THEN transfer_files.status
+                    ELSE excluded.status
+                END
             """,
             (
                 record.transfer_id,
