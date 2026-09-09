@@ -117,7 +117,13 @@ class TransferHistoryStore:
             log.error("Unable to create transfer history record: %s", error)
             return False
 
-    def update_transfer(self, transfer_id: str, **changes) -> bool:
+    def update_transfer(
+        self,
+        transfer_id: str,
+        *,
+        file_status: str | None = None,
+        **changes,
+    ) -> bool:
         allowed = {
             "peer_hostname",
             "status",
@@ -128,7 +134,7 @@ class TransferHistoryStore:
             "total_size",
         }
         values = {key: value for key, value in changes.items() if key in allowed}
-        if not self.available or not values:
+        if not self.available or (not values and file_status is None):
             return False
         extra_where = ""
         if values.get("status") in _INTERRUPTIBLE:
@@ -136,18 +142,24 @@ class TransferHistoryStore:
         assignments = ", ".join(f"{key} = ?" for key in values)
         try:
             with self._lock, self._connection() as connection:
-                cursor = connection.execute(
-                    f"UPDATE transfers SET {assignments} WHERE transfer_id = ?{extra_where}",
-                    (*values.values(), transfer_id),
-                )
-                return cursor.rowcount > 0
+                rowcount = 0
+                if values:
+                    cursor = connection.execute(
+                        f"UPDATE transfers SET {assignments} WHERE transfer_id = ?{extra_where}",
+                        (*values.values(), transfer_id),
+                    )
+                    rowcount = cursor.rowcount
+                if file_status is not None:
+                    connection.execute(
+                        "UPDATE transfer_files SET status = ? WHERE transfer_id = ?",
+                        (file_status, transfer_id),
+                    )
+                return rowcount > 0 or file_status is not None
         except sqlite3.DatabaseError as error:
             log.error("Unable to update transfer history record: %s", error)
             return False
 
-    def update_transfer_files_status(
-        self, transfer_id: str, status: str
-    ) -> bool:
+    def update_transfer_files_status(self, transfer_id: str, status: str) -> bool:
         if not self.available:
             return False
         try:

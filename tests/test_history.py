@@ -429,7 +429,13 @@ def test_rejected_child_history(tmp_path):
         deadline = time.time() + 5
         while time.time() < deadline:
             record = server_history.get_transfer(transfer_id)
-            if record and record.status == "rejected":
+            files = server_history.get_files(transfer_id)
+            if (
+                record
+                and record.status == "rejected"
+                and files
+                and files[0].status == "rejected"
+            ):
                 break
             time.sleep(0.02)
 
@@ -497,7 +503,13 @@ def test_expired_child_history(tmp_path):
         deadline = time.time() + 5
         while time.time() < deadline:
             record = server_history.get_transfer(transfer_id)
-            if record and record.status == "failed":
+            files = server_history.get_files(transfer_id)
+            if (
+                record
+                and record.status == "failed"
+                and files
+                and files[0].status == "failed"
+            ):
                 break
             time.sleep(0.02)
 
@@ -537,7 +549,9 @@ def test_cancelled_child_history(tmp_path):
     server_holder = []
 
     def cancel_it(request) -> None:
-        server_holder[0].cancel_incoming_request(request.transfer_id, "Cancelled by user")
+        server_holder[0].cancel_incoming_request(
+            request.transfer_id, "Cancelled by user"
+        )
 
     server = SecureTransfer(
         transfer_port=port,
@@ -568,7 +582,13 @@ def test_cancelled_child_history(tmp_path):
         deadline = time.time() + 5
         while time.time() < deadline:
             record = server_history.get_transfer(transfer_id)
-            if record and record.status == "cancelled":
+            files = server_history.get_files(transfer_id)
+            if (
+                record
+                and record.status == "cancelled"
+                and files
+                and files[0].status == "cancelled"
+            ):
                 break
             time.sleep(0.02)
 

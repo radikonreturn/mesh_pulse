@@ -398,7 +398,9 @@ class FileServer(threading.Thread):
                     direction=TransferDirection.RECV,
                     peer_ip=peer_ip,
                     status=(
-                        TransferStatus.RESUMING if resume_offset else TransferStatus.ACTIVE
+                        TransferStatus.RESUMING
+                        if resume_offset
+                        else TransferStatus.ACTIVE
                     ),
                     bytes_transferred=resume_offset,
                     peer_device_id=peer_device_id,
@@ -1650,6 +1652,11 @@ class SecureTransfer:
         error = request.reason
         if request.status == IncomingRequestStatus.EXPIRED and not error:
             error = "Transfer request expired"
+        child_status = {
+            IncomingRequestStatus.REJECTED: TransferStatus.REJECTED.value,
+            IncomingRequestStatus.EXPIRED: TransferStatus.FAILED.value,
+            IncomingRequestStatus.CANCELLED: TransferStatus.CANCELLED.value,
+        }.get(request.status)
         self._history.update_transfer(
             request.transfer_id,
             status=status,
@@ -1664,16 +1671,8 @@ class SecureTransfer:
                 else None
             ),
             error=error,
+            file_status=child_status,
         )
-        child_status = {
-            IncomingRequestStatus.REJECTED: TransferStatus.REJECTED.value,
-            IncomingRequestStatus.EXPIRED: TransferStatus.FAILED.value,
-            IncomingRequestStatus.CANCELLED: TransferStatus.CANCELLED.value,
-        }.get(request.status)
-        if child_status is not None:
-            self._history.update_transfer_files_status(
-                request.transfer_id, child_status
-            )
 
     def _handle_transfer_update(self) -> None:
         """Persist throttled progress, then fan out to the UI callback."""
@@ -1716,9 +1715,9 @@ class SecureTransfer:
         max_bytes = max(item.bytes_transferred for item in items)
         if best.status == TransferStatus.COMPLETE:
             max_bytes = best.filesize
-        completed_at = max(
-            (item.completed_at or 0 for item in items), default=0
-        ) or None
+        completed_at = (
+            max((item.completed_at or 0 for item in items), default=0) or None
+        )
         final_path = next(
             (item.final_path for item in items if item.final_path), best.final_path
         )
@@ -1737,12 +1736,15 @@ class SecureTransfer:
             file_id=best.file_id,
             resume_offset=max(item.resume_offset for item in items),
             bytes_transferred_this_attempt=best.bytes_transferred_this_attempt,
-            completed_at=completed_at if best.status in {
+            completed_at=completed_at
+            if best.status
+            in {
                 TransferStatus.COMPLETE,
                 TransferStatus.FAILED,
                 TransferStatus.CANCELLED,
                 TransferStatus.REJECTED,
-            } else None,
+            }
+            else None,
             message=best.message,
             sha256=best.sha256,
             final_path=final_path,
@@ -1773,7 +1775,10 @@ class SecureTransfer:
 
             status = self._aggregate_status(infos)
             existing = self._history.get_transfer(transfer_id)
-            if existing is not None and existing.status == TransferStatus.COMPLETE.value:
+            if (
+                existing is not None
+                and existing.status == TransferStatus.COMPLETE.value
+            ):
                 status = TransferStatus.COMPLETE
             elif (
                 status == TransferStatus.COMPLETE
