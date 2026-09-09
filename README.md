@@ -26,6 +26,25 @@ It pairs cryptographic peer identity with an interactive Textual interface, givi
 
 ---
 
+## Why Mesh-Pulse?
+
+| | Mesh-Pulse | Syncthing | scp / rsync | LocalSend |
+|---|---|---|---|---|
+| Primary use | Ad-hoc LAN transfers + peer/network visibility | Continuous folder synchronization | Scripted/manual remote file transfer | Simple GUI-based local file sharing |
+| Interface | Terminal TUI | Web UI | CLI | GUI |
+| Peer discovery | Automatic LAN discovery | Automatic | Usually manual host/IP | Automatic |
+| Trusted device identity | Yes | Yes | SSH host/key model | Device approval / TLS-based |
+| Incoming transfer approval | Yes | Not the same interaction model | No interactive receiver inbox by default | Yes |
+| Resumable transfers | Yes | Yes | Depends on tool/options | Implementation-dependent |
+| Transfer history | Built-in SQLite history | Synchronization/event history | Not built in | Limited |
+| LAN health / latency view | Built in | No | No | No |
+| Cloud account required | No | No | No | No |
+| Best fit | Terminal users who want peer visibility + secure ad-hoc transfer | Keeping folders synchronized | Automation, SSH workflows, servers | Easy non-technical file sharing |
+
+Mesh-Pulse is not intended to replace continuous synchronization tools or SSH-based automation. Its niche is a terminal-first LAN workspace where peer discovery, trust, availability, transfer approval, encrypted ad-hoc file transfer, and transfer history live in one interface.
+
+---
+
 ## Architecture
 
 Mesh-Pulse separates presentation, orchestration, core domain logic, and cryptographic protocol framing:
